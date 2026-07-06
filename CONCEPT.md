@@ -1,6 +1,6 @@
 # Fractal Explorer — Concept Specification
 
-**Status:** Concept / pre-design
+**Status:** In development — prototype (see §10)
 **Date:** 2026-07-06
 **Name:** *FractalX*
 
@@ -34,7 +34,7 @@ Three families, chosen to show self-similarity from three different angles:
 ### 3.1 Escape-time fractals (implicit self-similarity)
 - Mandelbrot set, Julia sets, Burning Ship, Multibrot, and **user-defined complex formulas** (small expression language, compiled to GPU shader).
 - Smooth/continuous coloring, interior coloring, orbit traps.
-- **Deep zoom**: GPU double precision for casual depth; perturbation theory + arbitrary-precision reference orbits for extreme zooms (10^30+).
+- **Deep zoom**: perturbation theory — arbitrary-precision reference orbit on the CPU, per-pixel f32 delta iteration with rebasing on the GPU — for zooms to ~10^30. (Metal has no shader f64, so f32+perturbation carries all depth beyond the plain path's ~10^4.)
 - Live **Mandelbrot ↔ Julia duality**: hover a point in the Mandelbrot set, see its Julia set update in a companion pane.
 
 ### 3.2 IFS & L-systems (explicit self-similarity)
@@ -74,7 +74,7 @@ Palette editor (gradient stops, cyclic palettes, palette import), applied post-h
 
 ## 5. Architecture sketch
 
-**Recommended stack: Rust + wgpu, with egui (or Tauri + web UI) for chrome.** Rationale: native performance for CPU-side arbitrary-precision math, first-class GPU compute for rendering, single-binary distribution on macOS (primary platform), and a language well-suited to a long-lived hobby codebase. Alternative considered: C++/OpenGL (more reference material for fractal deep-zoom, worse ergonomics).
+**Chosen stack: Rust + wgpu + egui (eframe), macOS-first.** Rationale: native performance for CPU-side arbitrary-precision math, first-class GPU compute for rendering, single-binary distribution on macOS (primary platform), and a language well-suited to a long-lived hobby codebase. Arbitrary precision is `dashu` (pure Rust — no C toolchain dependency; its decimal↔binary conversion is ~1 ulp, absorbed by 64 guard bits of precision headroom). Alternatives considered: C++/OpenGL (more deep-zoom reference material, worse ergonomics), rug/MPFR (faster bignums, GMP build dependency).
 
 ```
 ┌────────────────────────────────────────────┐
@@ -88,7 +88,7 @@ Palette editor (gradient stops, cyclic palettes, palette import), applied post-h
 │ module   │ module       │ module           │
 ├──────────┴──────────────┴──────────────────┤
 │ Render backends: GPU (wgpu compute/frag),  │
-│ CPU (rayon), arbitrary-precision (rug/MPFR)│
+│ CPU (rayon), arbitrary-precision (dashu)   │
 └────────────────────────────────────────────┘
 ```
 
@@ -118,7 +118,17 @@ Key contracts:
 
 ## 9. Open questions
 
-- Primary OS target macOS-only first, or cross-platform from day one?
-- UI toolkit: immediate-mode (egui, fast to iterate) vs. web-tech chrome (Tauri, prettier panels)?
 - How far to take the custom-formula language (full expression parser → shader codegen is a project in itself)?
 - Should the journal be per-project files or a single library database?
+
+Resolved: macOS-only first (cross-platform later via wgpu/egui). UI toolkit: egui via eframe.
+
+## 10. Implementation status
+
+Built so far (escape-time module):
+
+- **Mandelbrot explorer** — GPU-rendered (WGSL fragment shader), smooth pan/zoom anchored at the pointer, iteration slider to 100k, cyclic palette controls (§4.1, partially §4.5).
+- **PNG export with embedded bookmark** (§4.4/§4.5) — offscreen GPU render at arbitrary resolution; the complete view state travels in an iTXt chunk (versioned JSON, keyword `fractalx-bookmark`) and any exported PNG reopens to its exact view.
+- **Deep zoom to ~10^30** (§3.1) — perturbation with arbitrary-precision reference orbit (dashu), f32 delta iteration with rebasing on the GPU; orbit recomputed only when the view leaves its neighborhood. Verified by GPU tests (perturbation path must match the plain path where both are valid; a 10^-14 boundary view must show structure).
+
+Not yet started: progressive/cancellable refinement (§4.1 — deep views with high iteration counts currently render synchronously per frame), Julia companion pane, bookmarks journal, palette editor, other formulas, IFS/L-systems and natural/statistical modules, measurement tools.
