@@ -1,16 +1,19 @@
-// Escape-time Mandelbrot renderer, split into two passes:
+// Escape-time renderer (Mandelbrot, Burning Ship, Multibrot), split into:
 //
-//  1. Data pass (`fs_data`): iterates each pixel and writes the smooth
-//     (continuous) iteration count into an R32Float texture; interior pixels
-//     write -1. Two iteration paths:
-//      - plain: c computed directly in f32 (shallow zoom)
-//      - perturbation: pixel iterates its delta from a high-precision
-//        reference orbit (computed on CPU), with rebasing when the delta
-//        dominates. Keeps f32 sufficient down to ~1e-30 scales.
+//  1. Data pass: iterates each pixel and writes the smooth (continuous)
+//     iteration count into an R32Float texture; interior pixels write -1.
+//     Two implementations sharing one iteration core:
+//       - `fs_data` (fragment): whole image in one draw — used when
+//         max_iter is small enough to finish in a frame.
+//       - `cs_chunk` (compute): advances every pixel by a bounded number of
+//         iterations per dispatch, persisting per-pixel state — used at high
+//         max_iter so no single dispatch stalls the GPU.
 //  2. Color pass (`fs_color`): maps the data texture through the cyclic
 //     palette. Palette changes only re-run this cheap pass.
 //
-// Both passes draw a fullscreen triangle over the target.
+// Iteration paths: plain f32 (shallow zoom) or perturbation against a
+// high-precision CPU reference orbit with rebasing (deep zoom; classic
+// Mandelbrot only — the z² algebra doesn't carry to the other formulas).
 
 struct Uniforms {
     center: vec2<f32>,      // complex canvas center (plain path only)
@@ -19,6 +22,8 @@ struct Uniforms {
     max_iter: u32,
     ref_len: u32,           // number of valid entries in ref_orbit
     use_perturb: u32,       // 0 = plain path, 1 = perturbation path
+    formula: u32,           // 0 = Mandelbrot, 1 = Burning Ship, 2 = Multibrot
+    power: u32,             // Multibrot exponent (>= 2)
     _pad: u32,
 };
 
@@ -51,6 +56,7 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 
 const BAILOUT: f32 = 256.0; // large bailout for smooth coloring
 const INTERIOR: f32 = -1.0;
+const RUNNING: f32 = -2.0; // provisional: chunked pixel not yet resolved
 
 // Smooth (continuous) iteration count at escape.
 fn smooth_iter(iter: f32, z2: f32) -> f32 {
@@ -59,67 +65,144 @@ fn smooth_iter(iter: f32, z2: f32) -> f32 {
     return iter + 1.0 - nu;
 }
 
-// Plain f32 escape-time iteration.
-fn iterate_plain(c: vec2<f32>) -> f32 {
-    var z = vec2<f32>(0.0, 0.0);
-    var i: u32 = 0u;
-    loop {
-        if i >= u.max_iter {
-            return INTERIOR;
+// One plain-path step: z' = F(z) + c for the selected formula.
+fn step_plain(z: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
+    switch u.formula {
+        case 1u: { // Burning Ship: fold into the first quadrant, then square
+            let a = abs(z);
+            return cmul(a, a) + c;
         }
-        z = cmul(z, z) + c;
-        i = i + 1u;
-        if dot(z, z) > BAILOUT {
-            return smooth_iter(f32(i), dot(z, z));
+        case 2u: { // Multibrot: z^power + c (integer power, repeated mul)
+            var w = z;
+            for (var k = 1u; k < u.power; k = k + 1u) {
+                w = cmul(w, z);
+            }
+            return w + c;
+        }
+        default: {
+            return cmul(z, z) + c;
         }
     }
-    return INTERIOR; // unreachable; satisfies return analysis
 }
 
-// Perturbation iteration with rebasing (Zhuoran's method):
-// delta' = delta*(2*Z + delta) + dc; rebase to orbit start when the full
-// value falls below the delta or the reference orbit runs out.
-fn iterate_perturb(dc: vec2<f32>) -> f32 {
-    var dz = vec2<f32>(0.0, 0.0);
-    var m: u32 = 0u; // index into the reference orbit
-    var i: u32 = 0u;
-    loop {
-        if i >= u.max_iter {
-            return INTERIOR;
-        }
-        let zref = ref_orbit[m];
-        dz = cmul(dz, 2.0 * zref + dz) + dc;
-        m = m + 1u;
-        i = i + 1u;
+// Resumable per-pixel iteration state (also the chunked compute cell).
+struct IterState {
+    z: vec2<f32>,  // plain: z; perturbation: delta from the reference
+    i: u32,
+    m: u32,        // perturbation: index into the reference orbit
+    done: u32,
+    result: f32,
+};
 
-        let z = ref_orbit[m] + dz; // full value at iteration i
-        let z2 = dot(z, z);
-        if z2 > BAILOUT {
-            return smooth_iter(f32(i), z2);
+fn fresh_state() -> IterState {
+    return IterState(vec2<f32>(0.0, 0.0), 0u, 0u, 0u, RUNNING);
+}
+
+// Advance a pixel by up to `budget` iterations. `cc` is c (plain) or the
+// pixel's dc (perturbation). Sets done/result on escape or max_iter.
+fn iterate(s: ptr<function, IterState>, cc: vec2<f32>, budget: u32) {
+    var spent = 0u;
+    loop {
+        if (*s).i >= u.max_iter {
+            (*s).done = 1u;
+            (*s).result = INTERIOR;
+            return;
         }
-        // Rebase when the reference no longer dominates, or at orbit end.
-        if m + 1u >= u.ref_len || z2 < dot(dz, dz) {
-            dz = z;
-            m = 0u;
+        if spent >= budget {
+            return; // budget exhausted; caller persists state
+        }
+        if u.use_perturb == 1u {
+            // delta' = delta*(2*Z + delta) + dc, with rebasing (Zhuoran).
+            let zref = ref_orbit[(*s).m];
+            (*s).z = cmul((*s).z, 2.0 * zref + (*s).z) + cc;
+            (*s).m = (*s).m + 1u;
+            (*s).i = (*s).i + 1u;
+            spent = spent + 1u;
+
+            let z = ref_orbit[(*s).m] + (*s).z; // full value
+            let z2 = dot(z, z);
+            if z2 > BAILOUT {
+                (*s).done = 1u;
+                (*s).result = smooth_iter(f32((*s).i), z2);
+                return;
+            }
+            // Rebase when the reference stops dominating, or at orbit end.
+            if (*s).m + 1u >= u.ref_len || z2 < dot((*s).z, (*s).z) {
+                (*s).z = z;
+                (*s).m = 0u;
+            }
+        } else {
+            (*s).z = step_plain((*s).z, cc);
+            (*s).i = (*s).i + 1u;
+            spent = spent + 1u;
+            let z2 = dot((*s).z, (*s).z);
+            if z2 > BAILOUT {
+                (*s).done = 1u;
+                (*s).result = smooth_iter(f32((*s).i), z2);
+                return;
+            }
         }
     }
-    return INTERIOR; // unreachable; satisfies return analysis
+}
+
+// c (plain) or dc (perturbation) for a pixel at uv in [0,1].
+fn pixel_cc(uv: vec2<f32>) -> vec2<f32> {
+    // uv (0,0) = top-left of canvas. Complex plane: x right, y up.
+    let off = vec2<f32>(
+        (uv.x - 0.5) * 2.0 * u.half_extent.x,
+        (0.5 - uv.y) * 2.0 * u.half_extent.y,
+    );
+    if u.use_perturb == 1u {
+        return u.dc_offset + off;
+    }
+    return u.center + off;
 }
 
 @fragment
 fn fs_data(in: VertexOut) -> @location(0) vec4<f32> {
-    // uv (0,0) = top-left of canvas. Complex plane: x right, y up.
-    let off = vec2<f32>(
-        (in.uv.x - 0.5) * 2.0 * u.half_extent.x,
-        (0.5 - in.uv.y) * 2.0 * u.half_extent.y,
-    );
-    var v: f32;
-    if u.use_perturb == 1u {
-        v = iterate_perturb(u.dc_offset + off);
-    } else {
-        v = iterate_plain(u.center + off);
+    var s = fresh_state();
+    iterate(&s, pixel_cc(in.uv), u.max_iter);
+    return vec4<f32>(s.result, 0.0, 0.0, 1.0);
+}
+
+// ---- Chunked compute pass --------------------------------------------------
+
+struct ChunkParams {
+    size: vec2<u32>,   // data texture size in texels
+    chunk_iters: u32,  // iteration budget per dispatch
+    reset: u32,        // 1 = (re)initialize state on this dispatch
+};
+
+@group(0) @binding(2)
+var<storage, read_write> cells: array<IterState>;
+@group(0) @binding(3)
+var<uniform> cp: ChunkParams;
+@group(0) @binding(4)
+var data_out: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn cs_chunk(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= cp.size.x || gid.y >= cp.size.y {
+        return;
     }
-    return vec4<f32>(v, 0.0, 0.0, 1.0);
+    let idx = gid.y * cp.size.x + gid.x;
+
+    var s: IterState;
+    if cp.reset == 1u {
+        s = fresh_state();
+    } else {
+        s = cells[idx];
+        if s.done == 1u {
+            return; // final value already in the texture
+        }
+    }
+
+    let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(cp.size);
+    iterate(&s, pixel_cc(uv), cp.chunk_iters);
+
+    // RUNNING renders as interior (black) until the pixel resolves.
+    textureStore(data_out, vec2<i32>(gid.xy), vec4<f32>(s.result, 0.0, 0.0, 1.0));
+    cells[idx] = s;
 }
 
 // ---- Color pass ------------------------------------------------------------
@@ -146,7 +229,7 @@ fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
     // Target and data texture are the same size: 1:1 texel mapping.
     let v = textureLoad(data_tex, vec2<i32>(in.pos.xy), 0).x;
     if v < 0.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // interior
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // interior or still running
     }
     let t = v / 64.0; // color cycle length in iterations
     return vec4<f32>(palette(t), 1.0);

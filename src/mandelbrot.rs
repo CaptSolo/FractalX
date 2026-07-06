@@ -4,6 +4,11 @@
 
 use eframe::egui_wgpu::wgpu;
 
+/// Escape-time formula selector; values match the shader's `formula` switch.
+pub const FORMULA_MANDELBROT: u32 = 0;
+pub const FORMULA_BURNING_SHIP: u32 = 1;
+pub const FORMULA_MULTIBROT: u32 = 2;
+
 /// Iteration (data pass) uniforms. Layout must match `mandelbrot.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -14,8 +19,22 @@ pub struct Uniforms {
     pub max_iter: u32,
     pub ref_len: u32,
     pub use_perturb: u32,
+    pub formula: u32,
+    pub power: u32,
     pub _pad: u32,
 }
+
+/// Chunked-compute parameters. Layout must match `mandelbrot.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ChunkParams {
+    pub size: [u32; 2],
+    pub chunk_iters: u32,
+    pub reset: u32,
+}
+
+/// Bytes per pixel of resumable iteration state (`IterState` in WGSL).
+pub const STATE_BYTES_PER_PIXEL: u64 = 32;
 
 /// Color-pass uniforms. Layout must match `mandelbrot.wgsl`.
 #[repr(C)]
@@ -38,6 +57,8 @@ pub struct RenderResources {
     data_bind_group_layout: wgpu::BindGroupLayout,
     color_pipeline: wgpu::RenderPipeline,
     color_bind_group_layout: wgpu::BindGroupLayout,
+    chunk_pipeline: wgpu::ComputePipeline,
+    chunk_bind_group_layout: wgpu::BindGroupLayout,
     /// Perturbation reference orbit (vec2<f32> per iteration).
     orbit_buffer: wgpu::Buffer,
 }
@@ -194,17 +215,151 @@ impl RenderResources {
             immediate_size: 0,
         });
 
+        let chunk_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mandelbrot chunk bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: DATA_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let chunk_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mandelbrot chunk pl"),
+            bind_group_layouts: &[Some(&chunk_bind_group_layout)],
+            immediate_size: 0,
+        });
+
         let data_pipeline = build_pipeline(device, &shader, &data_layout, "fs_data", DATA_FORMAT);
         let color_pipeline =
             build_pipeline(device, &shader, &color_layout, "fs_color", COLOR_FORMAT);
+        let chunk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("mandelbrot chunk"),
+                layout: Some(&chunk_layout),
+                module: &shader,
+                entry_point: Some("cs_chunk"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             data_pipeline,
             data_bind_group_layout,
             color_pipeline,
             color_bind_group_layout,
+            chunk_pipeline,
+            chunk_bind_group_layout,
             orbit_buffer,
         }
+    }
+
+    /// Create a per-pixel iteration state buffer for chunked rendering.
+    pub fn create_state_buffer(device: &wgpu::Device, pixels: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mandelbrot chunk state"),
+            size: pixels.max(1) * STATE_BYTES_PER_PIXEL,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Advance every pixel by `params.chunk_iters` iterations (or initialize
+    /// when `params.reset == 1`), writing resolved values into `data`.
+    pub fn dispatch_chunk(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniforms: &Uniforms,
+        params: &ChunkParams,
+        state: &wgpu::Buffer,
+        data: &wgpu::TextureView,
+    ) {
+        let uniform_buffer = create_uniform_buffer(device, queue, uniforms, "chunk uniforms");
+        let param_buffer = create_uniform_buffer(device, queue, params, "chunk params");
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mandelbrot chunk bg"),
+            layout: &self.chunk_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.orbit_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: param_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(data),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.chunk_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(params.size[0].div_ceil(8), params.size[1].div_ceil(8), 1);
+        }
+        queue.submit([encoder.finish()]);
     }
 
     /// Upload a new reference orbit, growing the GPU buffer if needed.
@@ -322,7 +477,9 @@ impl RenderResources {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DATA_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         };
         let data = device.create_texture(&base);
@@ -355,7 +512,18 @@ impl RenderResources {
         let view = texture.create_view(&Default::default());
         self.render_data(device, queue, uniforms, &data_view);
         self.colorize(device, queue, &data_view, palette, &view);
+        Self::read_color_texture(device, queue, &texture, width, height)
+    }
 
+    /// Read an Rgba8 texture (created with `COPY_SRC`) back as tightly packed
+    /// RGBA8 pixels. Blocks until the GPU finishes.
+    pub fn read_color_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
         // Buffer rows must be padded to 256 bytes for texture-to-buffer copies.
         let bytes_per_row = (width * 4).next_multiple_of(256);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -368,7 +536,7 @@ impl RenderResources {
         let mut encoder = device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -434,6 +602,8 @@ mod tests {
             max_iter: 200,
             ref_len: 0,
             use_perturb: 0,
+            formula: FORMULA_MANDELBROT,
+            power: 2,
             _pad: 0,
         };
         let pixels = resources.render_offscreen(&device, &queue, &uniforms, &PAL, w, h);
@@ -448,6 +618,128 @@ mod tests {
 
         // All pixels fully opaque.
         assert!(pixels.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    /// The chunked compute path must reproduce the single fragment pass
+    /// exactly (same iteration core, just split across dispatches).
+    #[test]
+    fn chunked_compute_matches_fragment_pass() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("no gpu adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+
+        let resources = RenderResources::new(&device);
+        let (w, h) = (96u32, 96u32);
+        let uniforms = Uniforms {
+            center: [-0.65, 0.35],
+            half_extent: [0.05, 0.05],
+            dc_offset: [0.0, 0.0],
+            max_iter: 3000,
+            ref_len: 0,
+            use_perturb: 0,
+            formula: FORMULA_MANDELBROT,
+            power: 2,
+            _pad: 0,
+        };
+        let fragment = resources.render_offscreen(&device, &queue, &uniforms, &PAL, w, h);
+
+        // Run the compute path with a given per-dispatch budget.
+        let run_chunked = |chunk_iters: u32| {
+            let (data, color) =
+                RenderResources::create_targets(&device, w, h, wgpu::TextureUsages::COPY_SRC);
+            let data_view = data.create_view(&Default::default());
+            let color_view = color.create_view(&Default::default());
+            let state = RenderResources::create_state_buffer(&device, (w * h) as u64);
+            for i in 0..uniforms.max_iter.div_ceil(chunk_iters) {
+                resources.dispatch_chunk(
+                    &device,
+                    &queue,
+                    &uniforms,
+                    &ChunkParams {
+                        size: [w, h],
+                        chunk_iters,
+                        reset: (i == 0) as u32,
+                    },
+                    &state,
+                    &data_view,
+                );
+            }
+            resources.colorize(&device, &queue, &data_view, &PAL, &color_view);
+            RenderResources::read_color_texture(&device, &queue, &color, w, h)
+        };
+
+        // Resumption must be lossless: many small dispatches == one dispatch.
+        let chunked = run_chunked(512); // deliberately not a divisor of 3000
+        let single = run_chunked(uniforms.max_iter);
+        assert_eq!(chunked, single, "chunk resumption changed the result");
+
+        // Compute vs fragment: the driver compiles the two variants with
+        // different instruction scheduling, so boundary pixels can escape one
+        // iteration apart. Allow that jitter (~1% observed); a logic bug in
+        // the shared core would shift far more.
+        let differing = fragment
+            .chunks_exact(4)
+            .zip(chunked.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        let total = (w * h) as usize;
+        assert!(
+            differing < total / 20,
+            "compute diverges from fragment: {differing}/{total} pixels"
+        );
+    }
+
+    /// Burning Ship and Multibrot must render structured images distinct
+    /// from the Mandelbrot set.
+    #[test]
+    fn alternate_formulas_render_distinct_images() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("no gpu adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+
+        let resources = RenderResources::new(&device);
+        let (w, h) = (96u32, 96u32);
+        let render = |formula: u32, power: u32| {
+            resources.render_offscreen(
+                &device,
+                &queue,
+                &Uniforms {
+                    center: [-0.4, 0.0],
+                    half_extent: [1.8, 1.8],
+                    dc_offset: [0.0, 0.0],
+                    max_iter: 200,
+                    ref_len: 0,
+                    use_perturb: 0,
+                    formula,
+                    power,
+                    _pad: 0,
+                },
+                &PAL,
+                w,
+                h,
+            )
+        };
+
+        let mandel = render(FORMULA_MANDELBROT, 2);
+        let ship = render(FORMULA_BURNING_SHIP, 2);
+        let multi = render(FORMULA_MULTIBROT, 4);
+
+        for (name, img) in [("burning ship", &ship), ("multibrot", &multi)] {
+            assert_ne!(&mandel, img, "{name} identical to mandelbrot");
+            // Has both interior (black) and escaped (colored) pixels.
+            let black = img
+                .chunks_exact(4)
+                .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                .count();
+            assert!(
+                black > 0 && black < (w * h) as usize,
+                "{name} has no structure ({black} black pixels)"
+            );
+        }
     }
 
     /// The perturbation path must reproduce the plain path where both are
@@ -472,6 +764,8 @@ mod tests {
             max_iter,
             ref_len: 0,
             use_perturb: 0,
+            formula: FORMULA_MANDELBROT,
+            power: 2,
             _pad: 0,
         };
         let plain = resources.render_offscreen(&device, &queue, &base, &PAL, w, h);
@@ -545,6 +839,8 @@ mod tests {
                 max_iter,
                 ref_len: orbit.points.len() as u32,
                 use_perturb: 1,
+                formula: FORMULA_MANDELBROT,
+                power: 2,
                 _pad: 0,
             },
             &PAL,

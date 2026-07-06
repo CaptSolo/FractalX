@@ -14,6 +14,9 @@ use mandelbrot::{RenderResources, Uniforms};
 const IFS_POINTS_PER_FRAME: u64 = 1_000_000;
 /// Coarsest rung of the Mandelbrot resolution ladder (1/4 resolution).
 const LADDER_START_LEVEL: u32 = 2;
+/// Above this iteration cap, a rung renders via chunked compute (this many
+/// iterations per frame) instead of one long fragment dispatch.
+const CHUNK_ITERS: u32 = 2048;
 
 /// Once units-per-point drops below this, f32 in the shader is out of bits
 /// and rendering switches to the perturbation path.
@@ -27,10 +30,39 @@ const MIN_UNITS_PER_POINT: f64 = 1e-32;
 enum FractalRule {
     #[default]
     Mandelbrot,
+    BurningShip,
+    Multibrot {
+        power: u32,
+    },
     Ifs {
         maps: Vec<ifs::AffineMap>,
         points: u64,
     },
+}
+
+impl FractalRule {
+    fn is_escape_time(&self) -> bool {
+        !matches!(self, FractalRule::Ifs { .. })
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            FractalRule::Mandelbrot => "Mandelbrot",
+            FractalRule::BurningShip => "Burning Ship",
+            FractalRule::Multibrot { .. } => "Multibrot",
+            FractalRule::Ifs { .. } => "IFS (chaos game)",
+        }
+    }
+
+    /// Default viewport (center, units-per-point) for this family.
+    fn home_view(&self) -> ([f64; 2], f64) {
+        match self {
+            FractalRule::Mandelbrot => ([-0.5, 0.0], 0.004),
+            FractalRule::BurningShip => ([-0.4, -0.4], 0.005),
+            FractalRule::Multibrot { .. } => ([0.0, 0.0], 0.004),
+            FractalRule::Ifs { .. } => ([0.5, 0.43], 0.0016),
+        }
+    }
 }
 
 /// Complete view state — the "bookmark": it fully determines a render.
@@ -133,12 +165,22 @@ struct IfsCache {
 /// each frame re-renders one level finer until full resolution. The data
 /// (iteration) and color textures are separate so palette changes only
 /// re-colorize.
+/// An in-progress chunked rung: per-pixel iteration state on the GPU plus
+/// the number of dispatches left. `ceil(max_iter / CHUNK_ITERS)` dispatches
+/// guarantee every pixel resolves — no completion readback needed.
+struct ChunkJob {
+    state: wgpu::Buffer,
+    dispatches_left: u32,
+}
+
 struct MandelProgressive {
     /// Iteration-uniform bytes + full-resolution pixel size: the view.
     key: ([u8; std::mem::size_of::<Uniforms>()], [u32; 2]),
     palette: (f32, f32),
     /// Current rung: divisor is 1 << level, 0 = full resolution.
     level: u32,
+    /// Chunked iteration in progress for the current rung.
+    job: Option<ChunkJob>,
     /// World anchor of the rendered texture, for pan reprojection.
     center: deep::BigComplex,
     units_per_point: f64,
@@ -275,6 +317,14 @@ impl App {
             _ => (0, [0.0, 0.0], 0),
         };
 
+        let (formula, power) = match self.view.rule {
+            FractalRule::BurningShip => (mandelbrot::FORMULA_BURNING_SHIP, 2),
+            FractalRule::Multibrot { power } => {
+                (mandelbrot::FORMULA_MULTIBROT, power.max(2))
+            }
+            _ => (mandelbrot::FORMULA_MANDELBROT, 2),
+        };
+
         Uniforms {
             center: [center[0] as f32, center[1] as f32],
             half_extent: [half_w as f32, half_h as f32],
@@ -282,6 +332,8 @@ impl App {
             max_iter: self.view.max_iter,
             ref_len,
             use_perturb,
+            formula,
+            power,
             _pad: 0,
         }
     }
@@ -307,7 +359,9 @@ impl App {
             let (w, h) = (self.export_width.max(16), self.export_height.max(16));
 
             let pixels = match &self.view.rule {
-                FractalRule::Mandelbrot => {
+                FractalRule::Mandelbrot
+                | FractalRule::BurningShip
+                | FractalRule::Multibrot { .. } => {
                     let render_state = frame
                         .wgpu_render_state
                         .as_ref()
@@ -431,33 +485,61 @@ impl App {
         ui.heading("FractalX");
         ui.add_space(8.0);
 
-        let was_ifs = matches!(self.view.rule, FractalRule::Ifs { .. });
-        let mut is_ifs = was_ifs;
+        // Family selection: a discriminant-only copy drives the combo box.
+        let mut selected = std::mem::discriminant(&self.view.rule);
+        let choices: [FractalRule; 4] = [
+            FractalRule::Mandelbrot,
+            FractalRule::BurningShip,
+            FractalRule::Multibrot { power: 3 },
+            FractalRule::Ifs {
+                maps: vec![],
+                points: 0,
+            },
+        ];
         egui::ComboBox::from_label("Family")
-            .selected_text(if is_ifs { "IFS (chaos game)" } else { "Mandelbrot" })
+            .selected_text(self.view.rule.display_name())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut is_ifs, false, "Mandelbrot");
-                ui.selectable_value(&mut is_ifs, true, "IFS (chaos game)");
+                for choice in &choices {
+                    ui.selectable_value(
+                        &mut selected,
+                        std::mem::discriminant(choice),
+                        choice.display_name(),
+                    );
+                }
             });
-        if is_ifs != was_ifs {
-            if is_ifs {
+        if selected != std::mem::discriminant(&self.view.rule) {
+            let chosen = choices
+                .into_iter()
+                .find(|c| std::mem::discriminant(c) == selected)
+                .expect("selected comes from choices");
+            if matches!(chosen, FractalRule::Ifs { .. }) {
                 self.apply_preset(&ifs::PRESETS[0]);
             } else {
-                self.view.rule = FractalRule::Mandelbrot;
-                self.view.center = deep::BigComplex::from_f64(-0.5, 0.0);
-                self.view.units_per_point = 0.004;
+                let (center, upp) = chosen.home_view();
+                self.view.rule = chosen;
+                self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
+                self.view.units_per_point = upp;
                 self.ifs_cache = None;
             }
             self.orbit = None;
+            self.coord_edit.dirty = false;
         }
         ui.add_space(8.0);
 
         match &mut self.view.rule {
-            FractalRule::Mandelbrot => {
+            FractalRule::Mandelbrot | FractalRule::BurningShip => {
                 ui.label("Max iterations");
                 ui.add(
                     egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
                 );
+            }
+            FractalRule::Multibrot { power } => {
+                ui.label("Max iterations");
+                ui.add(
+                    egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
+                );
+                ui.label("Power");
+                ui.add(egui::Slider::new(power, 2..=8));
             }
             FractalRule::Ifs { maps, points } => {
                 ui.label("Points");
@@ -541,12 +623,12 @@ impl App {
         ui.add_space(12.0);
 
         if ui.button("Reset view").clicked() {
-            match self.view.rule {
-                FractalRule::Mandelbrot => {
-                    self.view.center = deep::BigComplex::from_f64(-0.5, 0.0);
-                    self.view.units_per_point = 0.004;
-                }
-                FractalRule::Ifs { .. } => self.fit_ifs_view(),
+            if self.view.rule.is_escape_time() {
+                let (center, upp) = self.view.rule.home_view();
+                self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
+                self.view.units_per_point = upp;
+            } else {
+                self.fit_ifs_view();
             }
             self.orbit = None;
         }
@@ -557,8 +639,8 @@ impl App {
         let zoom = 0.004 / self.view.units_per_point;
         let digits = (zoom.log10().max(0.0) as usize) + 6;
         let [re, im] = self.view.center.to_decimal_digits(digits);
-        match self.view.rule {
-            FractalRule::Mandelbrot => {
+        if self.view.rule.is_escape_time() {
+            {
                 // Editable position: the fields mirror the view until typed
                 // in, then hold the user's text until applied or reverted.
                 if !self.coord_edit.dirty {
@@ -600,11 +682,10 @@ impl App {
                     self.apply_coords();
                 }
             }
-            FractalRule::Ifs { .. } => {
-                ui.monospace(format!("x  {re}"));
-                ui.monospace(format!("y  {im}"));
-                ui.monospace(format!("zoom  {zoom:.3e}"));
-            }
+        } else {
+            ui.monospace(format!("x  {re}"));
+            ui.monospace(format!("y  {im}"));
+            ui.monospace(format!("zoom  {zoom:.3e}"));
         }
         if let (FractalRule::Ifs { points, .. }, Some(cache)) =
             (&self.view.rule, &self.ifs_cache)
@@ -627,6 +708,16 @@ impl App {
         {
             ui.add_space(4.0);
             ui.colored_label(ui.visuals().warn_fg_color, "Zoom limit reached (~1e30).");
+        }
+        if self.view.rule.is_escape_time()
+            && !matches!(self.view.rule, FractalRule::Mandelbrot)
+            && zoom > 3.0e4
+        {
+            ui.add_space(4.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Beyond f32 precision — deep zoom is Mandelbrot-only.",
+            );
         }
 
         ui.add_space(12.0);
@@ -704,9 +795,10 @@ impl App {
 
         self.canvas_size = rect.size();
         let dragging = response.dragged();
-        match self.view.rule {
-            FractalRule::Mandelbrot => self.paint_mandelbrot(ui, frame, rect, dragging),
-            FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
+        if self.view.rule.is_escape_time() {
+            self.paint_mandelbrot(ui, frame, rect, dragging);
+        } else {
+            self.paint_ifs(ui, rect);
         }
     }
 
@@ -758,60 +850,119 @@ impl App {
         key_bytes.copy_from_slice(bytemuck::bytes_of(&uniforms));
         let key = (key_bytes, full);
 
-        // Same view as last frame: climb one rung. New view: back to coarse.
-        let next_level = match &self.mandel_prog {
-            Some(p) if p.key == key => p.level.checked_sub(1),
-            _ => Some(LADDER_START_LEVEL),
+        // What to do this frame. Same view: advance the chunk job if one is
+        // running, else climb one rung, else recolor on palette change.
+        // New view: restart at the coarsest rung.
+        enum Action {
+            StartRung(u32),
+            AdvanceJob,
+            Recolor,
+            Nothing,
+        }
+        let action = match &self.mandel_prog {
+            Some(p) if p.key == key => {
+                if p.job.is_some() {
+                    Action::AdvanceJob
+                } else if p.level > 0 {
+                    Action::StartRung(p.level - 1)
+                } else if p.palette != palette {
+                    Action::Recolor
+                } else {
+                    Action::Nothing
+                }
+            }
+            _ => Action::StartRung(LADDER_START_LEVEL),
         };
-        let recolor_only = next_level.is_none()
-            && self.mandel_prog.as_ref().is_some_and(|p| p.palette != palette);
 
-        if next_level.is_some() || recolor_only {
-            let level = next_level
-                .unwrap_or_else(|| self.mandel_prog.as_ref().map_or(0, |p| p.level));
-            let div = 1u32 << level;
-            let size = [(full[0] / div).max(1), (full[1] / div).max(1)];
+        if !matches!(action, Action::Nothing) {
             let device = &render_state.device;
             let queue = &render_state.queue;
             let mut renderer = render_state.renderer.write();
 
-            let reuse = self
-                .mandel_prog
-                .as_ref()
-                .is_some_and(|p| p.texture_size == size);
-            if !reuse {
-                let (data_texture, color_texture) =
-                    RenderResources::create_targets(device, size[0], size[1], wgpu::TextureUsages::empty());
-                let color_view = color_texture.create_view(&Default::default());
-                let texture_id =
-                    renderer.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
-                if let Some(old) = self.mandel_prog.take() {
-                    renderer.free_texture(&old.texture_id);
+            if let Action::StartRung(level) = action {
+                let div = 1u32 << level;
+                let size = [(full[0] / div).max(1), (full[1] / div).max(1)];
+                let reuse = self
+                    .mandel_prog
+                    .as_ref()
+                    .is_some_and(|p| p.texture_size == size);
+                if !reuse {
+                    let (data_texture, color_texture) = RenderResources::create_targets(
+                        device,
+                        size[0],
+                        size[1],
+                        wgpu::TextureUsages::empty(),
+                    );
+                    let color_view = color_texture.create_view(&Default::default());
+                    let texture_id = renderer.register_native_texture(
+                        device,
+                        &color_view,
+                        wgpu::FilterMode::Linear,
+                    );
+                    if let Some(old) = self.mandel_prog.take() {
+                        renderer.free_texture(&old.texture_id);
+                    }
+                    self.mandel_prog = Some(MandelProgressive {
+                        key,
+                        palette,
+                        level,
+                        job: None,
+                        center: self.view.center.clone(),
+                        units_per_point: self.view.units_per_point,
+                        data_texture,
+                        color_texture,
+                        texture_id,
+                        texture_size: size,
+                    });
                 }
-                self.mandel_prog = Some(MandelProgressive {
-                    key,
-                    palette,
-                    level,
-                    center: self.view.center.clone(),
-                    units_per_point: self.view.units_per_point,
-                    data_texture,
-                    color_texture,
-                    texture_id,
-                    texture_size: size,
-                });
+                let prog = self.mandel_prog.as_mut().expect("just ensured");
+                prog.key = key;
+                prog.level = level;
+                prog.center = self.view.center.clone();
+                prog.units_per_point = self.view.units_per_point;
+                // High iteration caps run chunked so no dispatch stalls.
+                prog.job = if uniforms.max_iter > CHUNK_ITERS {
+                    Some(ChunkJob {
+                        state: RenderResources::create_state_buffer(
+                            device,
+                            size[0] as u64 * size[1] as u64,
+                        ),
+                        dispatches_left: uniforms.max_iter.div_ceil(CHUNK_ITERS),
+                    })
+                } else {
+                    None
+                };
             }
 
-            let prog = self.mandel_prog.as_mut().expect("just ensured");
-            prog.key = key;
-            prog.level = level;
+            let prog = self.mandel_prog.as_mut().expect("exists for all actions");
             prog.palette = palette;
-            prog.center = self.view.center.clone();
-            prog.units_per_point = self.view.units_per_point;
             let data_view = prog.data_texture.create_view(&Default::default());
             let color_view = prog.color_texture.create_view(&Default::default());
             if let Some(resources) = renderer.callback_resources.get::<RenderResources>() {
-                if !recolor_only {
-                    resources.render_data(device, queue, &uniforms, &data_view);
+                match (&action, &mut prog.job) {
+                    (Action::Recolor, _) => {}
+                    (_, Some(job)) => {
+                        let first = matches!(action, Action::StartRung(_));
+                        resources.dispatch_chunk(
+                            device,
+                            queue,
+                            &uniforms,
+                            &mandelbrot::ChunkParams {
+                                size: prog.texture_size,
+                                chunk_iters: CHUNK_ITERS,
+                                reset: first as u32,
+                            },
+                            &job.state,
+                            &data_view,
+                        );
+                        job.dispatches_left -= 1;
+                        if job.dispatches_left == 0 {
+                            prog.job = None;
+                        }
+                    }
+                    (_, None) => {
+                        resources.render_data(device, queue, &uniforms, &data_view);
+                    }
                 }
                 resources.colorize(
                     device,
@@ -830,7 +981,7 @@ impl App {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            if prog.level > 0 {
+            if prog.level > 0 || prog.job.is_some() {
                 ui.ctx().request_repaint();
             }
         }
