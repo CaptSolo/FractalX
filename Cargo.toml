@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
+dashu = "0.4.4"
 eframe = { version = "0.35.0", features = ["wgpu"] }
 png = "0.18.1"
 rfd = "0.17.2"

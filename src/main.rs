@@ -1,18 +1,25 @@
 //! FractalX — fractal explorer prototype.
 //! Milestone 1: GPU Mandelbrot with smooth pan/zoom, iteration and palette controls.
 
+mod deep;
 mod export;
 mod mandelbrot;
 
 use eframe::egui;
 use mandelbrot::{MandelbrotCallback, RenderResources, Uniforms};
 
+/// Once units-per-point drops below this, f32 in the shader is out of bits
+/// and rendering switches to the perturbation path.
+const PERTURB_THRESHOLD: f64 = 1e-7;
+/// Hard zoom floor: below this even f32 pixel deltas underflow (~1e30 zoom).
+const MIN_UNITS_PER_POINT: f64 = 1e-32;
+
 /// Complete view state — the "bookmark": it fully determines a render.
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ViewState {
-    /// Complex-plane coordinates of the canvas center. f64 so panning stays
-    /// stable ahead of the shader's f32 limit.
-    center: [f64; 2],
+    /// Complex-plane coordinates of the canvas center, arbitrary precision.
+    #[serde(with = "center_serde")]
+    center: deep::BigComplex,
     /// Complex units per screen point (zoom level).
     units_per_point: f64,
     max_iter: u32,
@@ -23,11 +30,39 @@ struct ViewState {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
-            center: [-0.5, 0.0],
+            center: deep::BigComplex::from_f64(-0.5, 0.0),
             units_per_point: 0.004,
             max_iter: 300,
             palette_freq: 1.0,
             palette_phase: 0.0,
+        }
+    }
+}
+
+/// Center serialization: decimal strings (v2 bookmarks). Deserialization also
+/// accepts the v1 format, a plain [f64; 2].
+mod center_serde {
+    use crate::deep::BigComplex;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(c: &BigComplex, s: S) -> Result<S::Ok, S::Error> {
+        c.to_decimal().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BigComplex, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Strings([String; 2]),
+            Numbers([f64; 2]),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Strings([re, im]) => {
+                // Generous parse precision; the app re-clamps to the zoom level.
+                let bits = re.len().max(im.len()) * 4 + 64;
+                BigComplex::from_decimal(&re, &im, bits).map_err(serde::de::Error::custom)
+            }
+            Repr::Numbers([re, im]) => Ok(BigComplex::from_f64(re, im)),
         }
     }
 }
@@ -40,6 +75,16 @@ struct Bookmark {
     view: ViewState,
 }
 
+/// CPU-side cache describing the reference orbit currently on the GPU.
+struct OrbitCache {
+    /// Reference point the orbit was computed at.
+    reference: deep::BigComplex,
+    len: u32,
+    escaped: bool,
+    /// `max_iter` the orbit was computed for.
+    for_max_iter: u32,
+}
+
 struct App {
     view: ViewState,
     /// Last known canvas size in points; export reproduces this framing.
@@ -47,6 +92,7 @@ struct App {
     export_width: u32,
     export_height: u32,
     status: Option<String>,
+    orbit: Option<OrbitCache>,
 }
 
 impl App {
@@ -69,6 +115,55 @@ impl App {
             export_width: 2560,
             export_height: 1440,
             status: None,
+            orbit: None,
+        }
+    }
+
+    fn perturbation_active(&self) -> bool {
+        self.view.units_per_point < PERTURB_THRESHOLD
+    }
+
+    /// Keep the reference orbit valid for the current view; recompute on the
+    /// CPU and upload when the view left its neighborhood or needs more
+    /// iterations. Runs before the UI so the frame always renders with a
+    /// valid orbit.
+    fn maintain_orbit(&mut self, frame: &eframe::Frame) {
+        if !self.perturbation_active() {
+            return;
+        }
+        let prec = deep::precision_for(self.view.units_per_point);
+        if self.view.center.re.precision() < prec {
+            self.view.center.set_precision(prec);
+        }
+
+        let needs_recompute = match &self.orbit {
+            None => true,
+            Some(cache) => {
+                let [dx, dy] = self.view.center.sub_to_f64(&cache.reference);
+                let half_w = self.view.units_per_point * self.canvas_size.x as f64 * 0.5;
+                let half_h = self.view.units_per_point * self.canvas_size.y as f64 * 0.5;
+                let drifted = dx.abs() > half_w * 0.5 || dy.abs() > half_h * 0.5;
+                let too_short = self.view.max_iter > cache.for_max_iter && !cache.escaped;
+                drifted || too_short
+            }
+        };
+        if !needs_recompute {
+            return;
+        }
+
+        let Some(render_state) = frame.wgpu_render_state.as_ref() else {
+            return;
+        };
+        let orbit = deep::reference_orbit(&self.view.center, self.view.max_iter, prec);
+        let mut renderer = render_state.renderer.write();
+        if let Some(resources) = renderer.callback_resources.get_mut::<RenderResources>() {
+            resources.upload_orbit(&render_state.device, &render_state.queue, &orbit.points);
+            self.orbit = Some(OrbitCache {
+                reference: self.view.center.clone(),
+                len: orbit.points.len() as u32,
+                escaped: orbit.escaped,
+                for_max_iter: self.view.max_iter,
+            });
         }
     }
 
@@ -77,10 +172,23 @@ impl App {
     fn uniforms_for_size(&self, width: f64, height: f64) -> Uniforms {
         let half_h = self.view.units_per_point * self.canvas_size.y as f64 * 0.5;
         let half_w = half_h * width / height;
+        let center = self.view.center.to_f64();
+
+        let (use_perturb, dc_offset, ref_len) = match &self.orbit {
+            Some(cache) if self.perturbation_active() => {
+                let [dx, dy] = self.view.center.sub_to_f64(&cache.reference);
+                (1, [dx as f32, dy as f32], cache.len)
+            }
+            _ => (0, [0.0, 0.0], 0),
+        };
+
         Uniforms {
-            center: [self.view.center[0] as f32, self.view.center[1] as f32],
+            center: [center[0] as f32, center[1] as f32],
             half_extent: [half_w as f32, half_h as f32],
+            dc_offset,
             max_iter: self.view.max_iter,
+            ref_len,
+            use_perturb,
             palette_freq: self.view.palette_freq,
             palette_phase: self.view.palette_phase,
             _pad: 0.0,
@@ -120,8 +228,8 @@ impl App {
 
             let bookmark = Bookmark {
                 app: "fractalx".to_owned(),
-                version: 1,
-                view: self.view,
+                version: 2,
+                view: self.view.clone(),
             };
             let json = serde_json::to_string(&bookmark).map_err(|e| e.to_string())?;
             export::save_png(&path, w, h, &pixels, &json)?;
@@ -145,6 +253,7 @@ impl App {
         self.status = Some(match result {
             Ok(bookmark) => {
                 self.view = bookmark.view;
+                self.orbit = None; // force a fresh reference orbit
                 format!("Restored view from {}", path.display())
             }
             Err(e) => format!("Load failed: {e}"),
@@ -157,7 +266,7 @@ impl App {
 
         ui.label("Max iterations");
         ui.add(
-            egui::Slider::new(&mut self.view.max_iter, 50..=5000)
+            egui::Slider::new(&mut self.view.max_iter, 50..=100_000)
                 .logarithmic(true),
         );
         ui.add_space(8.0);
@@ -169,32 +278,32 @@ impl App {
         ui.add_space(12.0);
 
         if ui.button("Reset view").clicked() {
-            let (freq, phase, iters) = (
-                self.view.palette_freq,
-                self.view.palette_phase,
-                self.view.max_iter,
-            );
             self.view = ViewState {
-                palette_freq: freq,
-                palette_phase: phase,
-                max_iter: iters,
+                palette_freq: self.view.palette_freq,
+                palette_phase: self.view.palette_phase,
+                max_iter: self.view.max_iter,
                 ..ViewState::default()
             };
+            self.orbit = None;
         }
 
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(4.0);
         let zoom = 0.004 / self.view.units_per_point;
-        ui.monospace(format!("re  {:+.12}", self.view.center[0]));
-        ui.monospace(format!("im  {:+.12}", self.view.center[1]));
-        ui.monospace(format!("zoom  {:.3e}", zoom));
-        if zoom > 3.0e4 {
+        let digits = (zoom.log10().max(0.0) as usize) + 6;
+        let [re, im] = self.view.center.to_decimal_digits(digits);
+        ui.monospace(format!("re  {re}"));
+        ui.monospace(format!("im  {im}"));
+        ui.monospace(format!("zoom  {zoom:.3e}"));
+        if self.perturbation_active() {
             ui.add_space(4.0);
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "Beyond f32 precision — pixelation expected. Deep zoom comes later.",
-            );
+            let pts = self.orbit.as_ref().map_or(0, |o| o.len);
+            ui.small(format!("Deep zoom: perturbation ({pts} ref pts)"));
+        }
+        if self.view.units_per_point <= MIN_UNITS_PER_POINT * 1.01 {
+            ui.add_space(4.0);
+            ui.colored_label(ui.visuals().warn_fg_color, "Zoom limit reached (~1e30).");
         }
 
         ui.add_space(12.0);
@@ -238,11 +347,16 @@ impl App {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-        // Pan: screen x right = +re, screen y down = -im.
+        let prec = deep::precision_for(self.view.units_per_point);
+
+        // Pan: screen x right = +re, screen y down = -im. Deltas are small
+        // enough for f64; only the accumulated center needs high precision.
         if response.dragged() {
             let d = response.drag_delta();
-            self.view.center[0] -= d.x as f64 * self.view.units_per_point;
-            self.view.center[1] += d.y as f64 * self.view.units_per_point;
+            let upp = self.view.units_per_point;
+            self.view
+                .center
+                .offset(-d.x as f64 * upp, d.y as f64 * upp, prec);
         }
 
         // Zoom (scroll wheel / trackpad pinch), anchored at the pointer.
@@ -254,9 +368,12 @@ impl App {
                     // Keep the complex point under the pointer fixed.
                     let off = pos - rect.center();
                     let upp = self.view.units_per_point;
-                    let new_upp = upp / factor;
-                    self.view.center[0] += off.x as f64 * (upp - new_upp);
-                    self.view.center[1] -= off.y as f64 * (upp - new_upp);
+                    let new_upp = (upp / factor).clamp(MIN_UNITS_PER_POINT, 0.1);
+                    self.view.center.offset(
+                        off.x as f64 * (upp - new_upp),
+                        -off.y as f64 * (upp - new_upp),
+                        deep::precision_for(new_upp),
+                    );
                     self.view.units_per_point = new_upp;
                 }
             }
@@ -274,6 +391,8 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.maintain_orbit(frame);
+
         egui::Panel::left("controls")
             .resizable(false)
             .default_size(220.0)

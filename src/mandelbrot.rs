@@ -8,7 +8,10 @@ use eframe::egui_wgpu::{self, wgpu};
 pub struct Uniforms {
     pub center: [f32; 2],
     pub half_extent: [f32; 2],
+    pub dc_offset: [f32; 2],
     pub max_iter: u32,
+    pub ref_len: u32,
+    pub use_perturb: u32,
     pub palette_freq: f32,
     pub palette_phase: f32,
     pub _pad: f32,
@@ -23,6 +26,40 @@ pub struct RenderResources {
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
+    /// Perturbation reference orbit (vec2<f32> per iteration).
+    orbit_buffer: wgpu::Buffer,
+}
+
+fn create_orbit_buffer(device: &wgpu::Device, points: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("reference orbit"),
+        size: (points.max(2) * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    orbit_buffer: &wgpu::Buffer,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: orbit_buffer.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn build_pipeline(
@@ -70,26 +107,38 @@ impl RenderResources {
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mandelbrot bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mandelbrot bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let orbit_buffer = create_orbit_buffer(device, 2);
+        let bind_group = create_bind_group(
+            device,
+            &bind_group_layout,
+            &uniform_buffer,
+            &orbit_buffer,
+            "mandelbrot bg",
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mandelbrot pl"),
@@ -111,7 +160,29 @@ impl RenderResources {
             bind_group_layout,
             bind_group,
             uniform_buffer,
+            orbit_buffer,
         }
+    }
+
+    /// Upload a new reference orbit, growing the GPU buffer if needed.
+    pub fn upload_orbit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        points: &[[f32; 2]],
+    ) {
+        let needed = (points.len().max(2) * 8) as u64;
+        if self.orbit_buffer.size() < needed {
+            self.orbit_buffer = create_orbit_buffer(device, points.len());
+            self.bind_group = create_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.uniform_buffer,
+                &self.orbit_buffer,
+                "mandelbrot bg",
+            );
+        }
+        queue.write_buffer(&self.orbit_buffer, 0, bytemuck::cast_slice(points));
     }
 
     /// Render `uniforms` into a `width` x `height` offscreen texture and read
@@ -132,14 +203,15 @@ impl RenderResources {
             mapped_at_creation: false,
         });
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("export bg"),
-            layout: &self.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        // Shares the live orbit buffer: the export view state matches the
+        // on-screen view, so the current orbit is the right one.
+        let bind_group = create_bind_group(
+            device,
+            &self.bind_group_layout,
+            &uniform_buffer,
+            &self.orbit_buffer,
+            "export bg",
+        );
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export target"),
@@ -246,7 +318,10 @@ mod tests {
         let uniforms = Uniforms {
             center: [-0.5, 0.0],
             half_extent: [1.6, 1.2],
+            dc_offset: [0.0, 0.0],
             max_iter: 200,
+            ref_len: 0,
+            use_perturb: 0,
             palette_freq: 1.0,
             palette_phase: 0.0,
             _pad: 0.0,
@@ -263,6 +338,121 @@ mod tests {
 
         // All pixels fully opaque.
         assert!(pixels.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    /// The perturbation path must reproduce the plain path where both are
+    /// valid (shallow zoom).
+    #[test]
+    fn perturbation_matches_plain_path() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("no gpu adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+
+        let mut resources = RenderResources::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let (w, h) = (96u32, 96u32);
+        let center = crate::deep::BigComplex::from_f64(-0.65, 0.35);
+        let max_iter = 300u32;
+
+        let base = Uniforms {
+            center: [-0.65, 0.35],
+            half_extent: [0.02, 0.02],
+            dc_offset: [0.0, 0.0],
+            max_iter,
+            ref_len: 0,
+            use_perturb: 0,
+            palette_freq: 1.0,
+            palette_phase: 0.0,
+            _pad: 0.0,
+        };
+        let plain = resources.render_offscreen(&device, &queue, &base, w, h);
+
+        let orbit = crate::deep::reference_orbit(&center, max_iter, 128);
+        resources.upload_orbit(&device, &queue, &orbit.points);
+        let perturbed = resources.render_offscreen(
+            &device,
+            &queue,
+            &Uniforms {
+                use_perturb: 1,
+                ref_len: orbit.points.len() as u32,
+                ..base
+            },
+            w,
+            h,
+        );
+
+        // Smooth coloring amplifies tiny float differences right at the set
+        // boundary: ~2.6% of pixels differ in practice, all boundary pixels.
+        // A systematic defect (e.g. an off-by-one in the delta iteration)
+        // would shift most of the image, so 5% separates noise from bugs.
+        let differing = plain
+            .chunks_exact(4)
+            .zip(perturbed.chunks_exact(4))
+            .filter(|(a, b)| {
+                a.iter()
+                    .zip(b.iter())
+                    .any(|(x, y)| x.abs_diff(*y) > 8)
+            })
+            .count();
+        let total = (w * h) as usize;
+        assert!(
+            differing < total / 20,
+            "perturbation diverges from plain path: {differing}/{total} pixels differ"
+        );
+    }
+
+    /// Deep zoom render (1e-14 scale — far beyond f32) must produce visible
+    /// structure, not a uniform block.
+    #[test]
+    fn deep_zoom_renders_structure() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("no gpu adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+
+        let mut resources = RenderResources::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let (w, h) = (64u32, 64u32);
+
+        // A point on the boundary (Misiurewicz-like), viewed at 1e-14 scale.
+        let center = crate::deep::BigComplex::from_decimal(
+            "-0.74364388703715870475",
+            "0.13182590420531197035",
+            160,
+        )
+        .unwrap();
+        let max_iter = 50_000u32;
+        let orbit = crate::deep::reference_orbit(&center, max_iter, 160);
+        resources.upload_orbit(&device, &queue, &orbit.points);
+
+        let pixels = resources.render_offscreen(
+            &device,
+            &queue,
+            &Uniforms {
+                center: [0.0, 0.0], // unused on the perturbation path
+                half_extent: [1e-14, 1e-14],
+                dc_offset: [0.0, 0.0],
+                max_iter,
+                ref_len: orbit.points.len() as u32,
+                use_perturb: 1,
+                palette_freq: 1.0,
+                palette_phase: 0.0,
+                _pad: 0.0,
+            },
+            w,
+            h,
+        );
+
+        let distinct: std::collections::HashSet<[u8; 4]> = pixels
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(
+            distinct.len() > 16,
+            "expected rich structure at deep zoom, got {} distinct colors",
+            distinct.len()
+        );
     }
 }
 
