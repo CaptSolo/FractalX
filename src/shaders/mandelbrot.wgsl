@@ -1,12 +1,16 @@
-// Escape-time Mandelbrot renderer.
-// Drawn as a fullscreen triangle over the callback viewport; uv covers the
-// canvas rect in [0,1] with y down (screen convention).
+// Escape-time Mandelbrot renderer, split into two passes:
 //
-// Two paths:
-//  - plain: c computed directly in f32 (shallow zoom)
-//  - perturbation: pixel iterates its delta from a high-precision reference
-//    orbit (computed on CPU), with rebasing when the delta dominates. This
-//    keeps f32 sufficient down to ~1e-30 scales.
+//  1. Data pass (`fs_data`): iterates each pixel and writes the smooth
+//     (continuous) iteration count into an R32Float texture; interior pixels
+//     write -1. Two iteration paths:
+//      - plain: c computed directly in f32 (shallow zoom)
+//      - perturbation: pixel iterates its delta from a high-precision
+//        reference orbit (computed on CPU), with rebasing when the delta
+//        dominates. Keeps f32 sufficient down to ~1e-30 scales.
+//  2. Color pass (`fs_color`): maps the data texture through the cyclic
+//     palette. Palette changes only re-run this cheap pass.
+//
+// Both passes draw a fullscreen triangle over the target.
 
 struct Uniforms {
     center: vec2<f32>,      // complex canvas center (plain path only)
@@ -15,9 +19,7 @@ struct Uniforms {
     max_iter: u32,
     ref_len: u32,           // number of valid entries in ref_orbit
     use_perturb: u32,       // 0 = plain path, 1 = perturbation path
-    palette_freq: f32,
-    palette_phase: f32,
-    _pad: f32,
+    _pad: u32,
 };
 
 @group(0) @binding(0)
@@ -43,57 +45,47 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
     return out;
 }
 
-fn palette(t: f32) -> vec3<f32> {
-    // Cyclic cosine palette.
-    let phase = vec3<f32>(0.0, 0.33, 0.67) + u.palette_phase;
-    return 0.5 + 0.5 * cos(6.2831853 * (t * u.palette_freq + phase));
-}
-
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
 const BAILOUT: f32 = 256.0; // large bailout for smooth coloring
+const INTERIOR: f32 = -1.0;
 
-fn color(iter: f32, z2: f32) -> vec4<f32> {
-    if iter < 0.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // interior
-    }
-    // Smooth (continuous) iteration count.
+// Smooth (continuous) iteration count at escape.
+fn smooth_iter(iter: f32, z2: f32) -> f32 {
     let log_zn = log(z2) * 0.5;
     let nu = log(log_zn / log(2.0)) / log(2.0);
-    let smooth_i = iter + 1.0 - nu;
-    let t = smooth_i / 64.0; // color cycle length in iterations
-    return vec4<f32>(palette(t), 1.0);
+    return iter + 1.0 - nu;
 }
 
 // Plain f32 escape-time iteration.
-fn iterate_plain(c: vec2<f32>) -> vec4<f32> {
+fn iterate_plain(c: vec2<f32>) -> f32 {
     var z = vec2<f32>(0.0, 0.0);
     var i: u32 = 0u;
     loop {
         if i >= u.max_iter {
-            return color(-1.0, 0.0);
+            return INTERIOR;
         }
         z = cmul(z, z) + c;
         i = i + 1u;
         if dot(z, z) > BAILOUT {
-            return color(f32(i), dot(z, z));
+            return smooth_iter(f32(i), dot(z, z));
         }
     }
-    return color(-1.0, 0.0); // unreachable; satisfies return analysis
+    return INTERIOR; // unreachable; satisfies return analysis
 }
 
 // Perturbation iteration with rebasing (Zhuoran's method):
 // delta' = delta*(2*Z + delta) + dc; rebase to orbit start when the full
 // value falls below the delta or the reference orbit runs out.
-fn iterate_perturb(dc: vec2<f32>) -> vec4<f32> {
+fn iterate_perturb(dc: vec2<f32>) -> f32 {
     var dz = vec2<f32>(0.0, 0.0);
     var m: u32 = 0u; // index into the reference orbit
     var i: u32 = 0u;
     loop {
         if i >= u.max_iter {
-            return color(-1.0, 0.0);
+            return INTERIOR;
         }
         let zref = ref_orbit[m];
         dz = cmul(dz, 2.0 * zref + dz) + dc;
@@ -103,7 +95,7 @@ fn iterate_perturb(dc: vec2<f32>) -> vec4<f32> {
         let z = ref_orbit[m] + dz; // full value at iteration i
         let z2 = dot(z, z);
         if z2 > BAILOUT {
-            return color(f32(i), z2);
+            return smooth_iter(f32(i), z2);
         }
         // Rebase when the reference no longer dominates, or at orbit end.
         if m + 1u >= u.ref_len || z2 < dot(dz, dz) {
@@ -111,18 +103,51 @@ fn iterate_perturb(dc: vec2<f32>) -> vec4<f32> {
             m = 0u;
         }
     }
-    return color(-1.0, 0.0); // unreachable; satisfies return analysis
+    return INTERIOR; // unreachable; satisfies return analysis
 }
 
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_data(in: VertexOut) -> @location(0) vec4<f32> {
     // uv (0,0) = top-left of canvas. Complex plane: x right, y up.
     let off = vec2<f32>(
         (in.uv.x - 0.5) * 2.0 * u.half_extent.x,
         (0.5 - in.uv.y) * 2.0 * u.half_extent.y,
     );
+    var v: f32;
     if u.use_perturb == 1u {
-        return iterate_perturb(u.dc_offset + off);
+        v = iterate_perturb(u.dc_offset + off);
+    } else {
+        v = iterate_plain(u.center + off);
     }
-    return iterate_plain(u.center + off);
+    return vec4<f32>(v, 0.0, 0.0, 1.0);
+}
+
+// ---- Color pass ------------------------------------------------------------
+
+struct PaletteUniforms {
+    freq: f32,
+    phase: f32,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var data_tex: texture_2d<f32>;
+@group(0) @binding(1)
+var<uniform> pal: PaletteUniforms;
+
+fn palette(t: f32) -> vec3<f32> {
+    // Cyclic cosine palette.
+    let phase = vec3<f32>(0.0, 0.33, 0.67) + pal.phase;
+    return 0.5 + 0.5 * cos(6.2831853 * (t * pal.freq + phase));
+}
+
+@fragment
+fn fs_color(in: VertexOut) -> @location(0) vec4<f32> {
+    // Target and data texture are the same size: 1:1 texel mapping.
+    let v = textureLoad(data_tex, vec2<i32>(in.pos.xy), 0).x;
+    if v < 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // interior
+    }
+    let t = v / 64.0; // color cycle length in iterations
+    return vec4<f32>(palette(t), 1.0);
 }

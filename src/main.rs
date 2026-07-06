@@ -130,13 +130,20 @@ struct IfsCache {
 
 /// Progressive Mandelbrot render: a resolution ladder. While the view
 /// changes, only the coarsest level is rendered (cheap); once it settles,
-/// each frame re-renders one level finer until full resolution.
+/// each frame re-renders one level finer until full resolution. The data
+/// (iteration) and color textures are separate so palette changes only
+/// re-colorize.
 struct MandelProgressive {
-    /// Uniform bytes + full-resolution pixel size: identifies the view.
-    key: ([u8; 48], [u32; 2]),
+    /// Iteration-uniform bytes + full-resolution pixel size: the view.
+    key: ([u8; std::mem::size_of::<Uniforms>()], [u32; 2]),
+    palette: (f32, f32),
     /// Current rung: divisor is 1 << level, 0 = full resolution.
     level: u32,
-    texture: wgpu::Texture,
+    /// World anchor of the rendered texture, for pan reprojection.
+    center: deep::BigComplex,
+    units_per_point: f64,
+    data_texture: wgpu::Texture,
+    color_texture: wgpu::Texture,
     texture_id: egui::TextureId,
     texture_size: [u32; 2],
 }
@@ -275,9 +282,15 @@ impl App {
             max_iter: self.view.max_iter,
             ref_len,
             use_perturb,
-            palette_freq: self.view.palette_freq,
-            palette_phase: self.view.palette_phase,
-            _pad: 0.0,
+            _pad: 0,
+        }
+    }
+
+    fn palette_uniforms(&self) -> mandelbrot::PaletteUniforms {
+        mandelbrot::PaletteUniforms {
+            freq: self.view.palette_freq,
+            phase: self.view.palette_phase,
+            _pad: [0.0; 2],
         }
     }
 
@@ -309,6 +322,7 @@ impl App {
                         &render_state.device,
                         &render_state.queue,
                         &uniforms,
+                        &self.palette_uniforms(),
                         w,
                         h,
                     )
@@ -689,8 +703,9 @@ impl App {
         }
 
         self.canvas_size = rect.size();
+        let dragging = response.dragged();
         match self.view.rule {
-            FractalRule::Mandelbrot => self.paint_mandelbrot(ui, frame, rect),
+            FractalRule::Mandelbrot => self.paint_mandelbrot(ui, frame, rect, dragging),
             FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
         }
     }
@@ -698,17 +713,48 @@ impl App {
     /// Progressive Mandelbrot: render into a texture via a resolution ladder.
     /// A view change restarts at 1/4 resolution (cheap enough to keep any
     /// interaction fluid); each following frame re-renders one level finer.
-    fn paint_mandelbrot(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, rect: egui::Rect) {
+    /// A palette-only change re-colorizes the existing data texture without
+    /// re-iterating (and without restarting the ladder).
+    fn paint_mandelbrot(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        rect: egui::Rect,
+        dragging: bool,
+    ) {
         let Some(render_state) = frame.wgpu_render_state.as_ref() else {
             return;
         };
+
+        // While actively panning (same zoom), don't re-render at all: paint
+        // the existing texture shifted by the pan delta. The ladder restarts
+        // on release, so dragging shows the sharp image sliding instead of a
+        // coarse re-render.
+        if dragging {
+            if let Some(prog) = &self.mandel_prog {
+                if prog.units_per_point == self.view.units_per_point {
+                    let [dx, dy] = self.view.center.sub_to_f64(&prog.center);
+                    let upp = prog.units_per_point;
+                    let off = egui::vec2((-dx / upp) as f32, (dy / upp) as f32);
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    ui.painter().image(
+                        prog.texture_id,
+                        rect.translate(off),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    return;
+                }
+            }
+        }
         let ppp = ui.ctx().pixels_per_point();
         let full = [
             ((rect.width() * ppp) as u32).clamp(16, 8192),
             ((rect.height() * ppp) as u32).clamp(16, 8192),
         ];
         let uniforms = self.uniforms_for_size(rect.width() as f64, rect.height() as f64);
-        let mut key_bytes = [0u8; 48];
+        let palette = (self.view.palette_freq, self.view.palette_phase);
+        let mut key_bytes = [0u8; std::mem::size_of::<Uniforms>()];
         key_bytes.copy_from_slice(bytemuck::bytes_of(&uniforms));
         let key = (key_bytes, full);
 
@@ -717,11 +763,16 @@ impl App {
             Some(p) if p.key == key => p.level.checked_sub(1),
             _ => Some(LADDER_START_LEVEL),
         };
+        let recolor_only = next_level.is_none()
+            && self.mandel_prog.as_ref().is_some_and(|p| p.palette != palette);
 
-        if let Some(level) = next_level {
+        if next_level.is_some() || recolor_only {
+            let level = next_level
+                .unwrap_or_else(|| self.mandel_prog.as_ref().map_or(0, |p| p.level));
             let div = 1u32 << level;
             let size = [(full[0] / div).max(1), (full[1] / div).max(1)];
             let device = &render_state.device;
+            let queue = &render_state.queue;
             let mut renderer = render_state.renderer.write();
 
             let reuse = self
@@ -729,31 +780,22 @@ impl App {
                 .as_ref()
                 .is_some_and(|p| p.texture_size == size);
             if !reuse {
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("mandelbrot progressive"),
-                    size: wgpu::Extent3d {
-                        width: size[0],
-                        height: size[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&Default::default());
+                let (data_texture, color_texture) =
+                    RenderResources::create_targets(device, size[0], size[1], wgpu::TextureUsages::empty());
+                let color_view = color_texture.create_view(&Default::default());
                 let texture_id =
-                    renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+                    renderer.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
                 if let Some(old) = self.mandel_prog.take() {
                     renderer.free_texture(&old.texture_id);
                 }
                 self.mandel_prog = Some(MandelProgressive {
                     key,
+                    palette,
                     level,
-                    texture,
+                    center: self.view.center.clone(),
+                    units_per_point: self.view.units_per_point,
+                    data_texture,
+                    color_texture,
                     texture_id,
                     texture_size: size,
                 });
@@ -762,9 +804,22 @@ impl App {
             let prog = self.mandel_prog.as_mut().expect("just ensured");
             prog.key = key;
             prog.level = level;
-            let view = prog.texture.create_view(&Default::default());
+            prog.palette = palette;
+            prog.center = self.view.center.clone();
+            prog.units_per_point = self.view.units_per_point;
+            let data_view = prog.data_texture.create_view(&Default::default());
+            let color_view = prog.color_texture.create_view(&Default::default());
             if let Some(resources) = renderer.callback_resources.get::<RenderResources>() {
-                resources.render_to_texture(device, &render_state.queue, &uniforms, &view);
+                if !recolor_only {
+                    resources.render_data(device, queue, &uniforms, &data_view);
+                }
+                resources.colorize(
+                    device,
+                    queue,
+                    &data_view,
+                    &self.palette_uniforms(),
+                    &color_view,
+                );
             }
         }
 

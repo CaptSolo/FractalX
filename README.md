@@ -4,8 +4,10 @@ A fast, native fractal explorer for macOS, written in Rust with GPU rendering
 (wgpu/Metal) and an egui interface.
 
 Zoom into the Mandelbrot set down to **~10³⁰×** magnification — far beyond
-double precision — and export any view as a PNG that carries its exact
-coordinates inside, so every image can be reopened right where it was taken.
+double precision — build iterated function systems (Barnsley fern, Sierpinski
+triangle, or your own) with a live affine-map editor, and export any view as a
+PNG that carries its exact coordinates inside, so every image can be reopened
+right where it was taken.
 
 ![FractalX exploring the Mandelbrot set](assets/full_ui_view.png)
 
@@ -18,11 +20,21 @@ zooming in.*
 
 - **GPU-rendered Mandelbrot explorer** — smooth pan (drag) and zoom
   (scroll/pinch, anchored at the pointer), iteration depth up to 100,000,
-  adjustable cyclic color palette.
+  adjustable cyclic color palette, and exact coordinate entry (paste a
+  40-digit deep-zoom location and jump straight there).
 - **Deep zoom via perturbation theory** — a single reference orbit is computed
   on the CPU in arbitrary-precision arithmetic; the GPU iterates only each
   pixel's tiny delta in f32, with rebasing. Precision scales automatically
   with zoom depth. Works to ~10³⁰×, where f32 pixel deltas finally underflow.
+- **IFS explorer (chaos game)** — a second fractal family: iterated function
+  systems rendered as density plots. Ships with Sierpinski triangle, Barnsley
+  fern, and Heighway dragon presets; edit the affine maps live (or add your
+  own) and watch the attractor respond. *Reset view* fits the viewport to the
+  attractor.
+- **Progressive rendering** — interaction never stalls: the Mandelbrot view
+  renders through a resolution ladder (coarse immediately, sharpening in
+  place), and IFS images "develop" as the chaos game accumulates points each
+  frame.
 - **PNG export with embedded bookmarks** — renders offscreen at any resolution
   (up to 16K), independent of the window. The complete view state (center
   coordinates at full precision, zoom, iterations, palette) is embedded in the
@@ -52,12 +64,15 @@ cargo test
 
 | Action | Input |
 |---|---|
+| Switch fractal family | *Family* dropdown (Mandelbrot / IFS) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
-| Iterations / palette | sliders in the left panel |
+| Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |
+| Iterations / points / palette | sliders in the left panel |
+| Edit an IFS | preset buttons, then tweak the affine-map coefficients |
 | Export image | set resolution, *Export PNG…* |
 | Reopen an exported view | *Open PNG bookmark…* |
-| Back to the full set | *Reset view* |
+| Back to the full set / fit attractor | *Reset view* |
 
 When you zoom past ~3×10⁴×, the renderer switches to the perturbation path
 automatically (shown in the panel). If detail dissolves into flat color at
@@ -87,9 +102,9 @@ self-similarity (escape-time fractals, IFS/L-systems, and statistical
 fractals); see [CONCEPT.md](CONCEPT.md) for the full vision and current
 implementation status.
 
-Planned next: progressive/cancellable rendering, a hover-linked Julia
-companion pane, a bookmarks journal with thumbnails, palette editor, more
-formulas (Burning Ship, Multibrot, custom expressions).
+Planned next: visual drag-handle editing of IFS maps, a hover-linked Julia
+companion pane, a bookmarks journal with thumbnails, palette editor, L-systems,
+more formulas (Burning Ship, Multibrot, custom expressions).
 
 ## Tech
 

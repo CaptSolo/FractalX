@@ -1,8 +1,10 @@
-//! GPU Mandelbrot renderer, drawn into the egui canvas via a wgpu paint callback.
+//! GPU Mandelbrot renderer: a data pass iterates pixels into an R32Float
+//! texture (smooth iteration counts), a color pass maps that through the
+//! palette. Palette changes only re-run the cheap color pass.
 
 use eframe::egui_wgpu::wgpu;
 
-/// Shader uniforms. Layout must match `mandelbrot.wgsl`.
+/// Iteration (data pass) uniforms. Layout must match `mandelbrot.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -12,20 +14,30 @@ pub struct Uniforms {
     pub max_iter: u32,
     pub ref_len: u32,
     pub use_perturb: u32,
-    pub palette_freq: f32,
-    pub palette_phase: f32,
-    pub _pad: f32,
+    pub _pad: u32,
 }
+
+/// Color-pass uniforms. Layout must match `mandelbrot.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PaletteUniforms {
+    pub freq: f32,
+    pub phase: f32,
+    pub _pad: [f32; 2],
+}
+
+/// The data texture format (smooth iteration count per pixel, -1 interior).
+pub const DATA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+/// The displayable color texture format.
+pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Wgpu resources shared across frames, stored in the egui renderer's
 /// `callback_resources` type map.
-///
-/// All rendering goes to offscreen Rgba8UnormSrgb textures: the live view
-/// paints a progressively-refined texture (resolution ladder in `main.rs`),
-/// and PNG export reads one back.
 pub struct RenderResources {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    data_pipeline: wgpu::RenderPipeline,
+    data_bind_group_layout: wgpu::BindGroupLayout,
+    color_pipeline: wgpu::RenderPipeline,
+    color_bind_group_layout: wgpu::BindGroupLayout,
     /// Perturbation reference orbit (vec2<f32> per iteration).
     orbit_buffer: wgpu::Buffer,
 }
@@ -66,10 +78,11 @@ fn build_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
+    fs_entry: &str,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("mandelbrot pipeline"),
+        label: Some(fs_entry),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
@@ -79,7 +92,7 @@ fn build_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fs_entry),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),
@@ -91,6 +104,22 @@ fn build_pipeline(
     })
 }
 
+fn create_uniform_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    value: &T,
+    label: &str,
+) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: std::mem::size_of::<T>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(value));
+    buffer
+}
+
 impl RenderResources {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -98,50 +127,82 @@ impl RenderResources {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mandelbrot.wgsl").into()),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mandelbrot bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let data_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mandelbrot data bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
+
+        let color_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mandelbrot color bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let orbit_buffer = create_orbit_buffer(device, 2);
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mandelbrot pl"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+        let data_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mandelbrot data pl"),
+            bind_group_layouts: &[Some(&data_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let color_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mandelbrot color pl"),
+            bind_group_layouts: &[Some(&color_bind_group_layout)],
             immediate_size: 0,
         });
 
-        let pipeline = build_pipeline(
-            device,
-            &shader,
-            &pipeline_layout,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        );
+        let data_pipeline = build_pipeline(device, &shader, &data_layout, "fs_data", DATA_FORMAT);
+        let color_pipeline =
+            build_pipeline(device, &shader, &color_layout, "fs_color", COLOR_FORMAT);
 
         Self {
-            pipeline,
-            bind_group_layout,
+            data_pipeline,
+            data_bind_group_layout,
+            color_pipeline,
+            color_bind_group_layout,
             orbit_buffer,
         }
     }
@@ -160,31 +221,63 @@ impl RenderResources {
         queue.write_buffer(&self.orbit_buffer, 0, bytemuck::cast_slice(points));
     }
 
-    /// Render `uniforms` into the given Rgba8UnormSrgb texture view and
-    /// submit. Non-blocking; used by both the live resolution ladder and
-    /// export.
-    pub fn render_to_texture(
+    /// Iterate `uniforms` into the given R32Float data texture view.
+    /// Non-blocking; used by both the live resolution ladder and export.
+    pub fn render_data(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         uniforms: &Uniforms,
         target: &wgpu::TextureView,
     ) {
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mandelbrot uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        let uniform_buffer =
+            create_uniform_buffer(device, queue, uniforms, "mandelbrot uniforms");
         let bind_group = create_bind_group(
             device,
-            &self.bind_group_layout,
+            &self.data_bind_group_layout,
             &uniform_buffer,
             &self.orbit_buffer,
-            "mandelbrot bg",
+            "mandelbrot data bg",
         );
+        self.fullscreen_pass(device, queue, &self.data_pipeline, &bind_group, target);
+    }
 
+    /// Map a data texture through the palette into an Rgba8UnormSrgb target
+    /// of the same size. Cheap; re-run alone on palette changes.
+    pub fn colorize(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &wgpu::TextureView,
+        palette: &PaletteUniforms,
+        target: &wgpu::TextureView,
+    ) {
+        let uniform_buffer = create_uniform_buffer(device, queue, palette, "palette uniforms");
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mandelbrot color bg"),
+            layout: &self.color_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(data),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.fullscreen_pass(device, queue, &self.color_pipeline, &bind_group, target);
+    }
+
+    fn fullscreen_pass(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+    ) {
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -203,39 +296,65 @@ impl RenderResources {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit([encoder.finish()]);
     }
 
-    /// Render `uniforms` into a `width` x `height` offscreen texture and read
-    /// back tightly packed RGBA8 pixels. Blocks until the GPU finishes.
+    /// Create a data + color texture pair of the given size.
+    pub fn create_targets(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        color_extra_usage: wgpu::TextureUsages,
+    ) -> (wgpu::Texture, wgpu::Texture) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let base = wgpu::TextureDescriptor {
+            label: Some("mandelbrot data"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DATA_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let data = device.create_texture(&base);
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mandelbrot color"),
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | color_extra_usage,
+            ..base
+        });
+        (data, color)
+    }
+
+    /// Render `uniforms` colored by `palette` into a `width` x `height`
+    /// offscreen texture pair and read back tightly packed RGBA8 pixels.
+    /// Blocks until the GPU finishes.
     pub fn render_offscreen(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         uniforms: &Uniforms,
+        palette: &PaletteUniforms,
         width: u32,
         height: u32,
     ) -> Vec<u8> {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("export target"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let (data, texture) =
+            Self::create_targets(device, width, height, wgpu::TextureUsages::COPY_SRC);
+        let data_view = data.create_view(&Default::default());
         let view = texture.create_view(&Default::default());
-        self.render_to_texture(device, queue, uniforms, &view);
+        self.render_data(device, queue, uniforms, &data_view);
+        self.colorize(device, queue, &data_view, palette, &view);
 
         // Buffer rows must be padded to 256 bytes for texture-to-buffer copies.
         let bytes_per_row = (width * 4).next_multiple_of(256);
@@ -290,6 +409,12 @@ impl RenderResources {
 mod tests {
     use super::*;
 
+    const PAL: PaletteUniforms = PaletteUniforms {
+        freq: 1.0,
+        phase: 0.0,
+        _pad: [0.0; 2],
+    };
+
     /// Headless GPU round trip: render offscreen, check the image is a
     /// plausible Mandelbrot (interior black, exterior colored).
     #[test]
@@ -309,11 +434,9 @@ mod tests {
             max_iter: 200,
             ref_len: 0,
             use_perturb: 0,
-            palette_freq: 1.0,
-            palette_phase: 0.0,
-            _pad: 0.0,
+            _pad: 0,
         };
-        let pixels = resources.render_offscreen(&device, &queue, &uniforms, w, h);
+        let pixels = resources.render_offscreen(&device, &queue, &uniforms, &PAL, w, h);
         assert_eq!(pixels.len(), (w * h * 4) as usize);
 
         // Center pixel (-0.5, 0) is inside the set: black.
@@ -349,11 +472,9 @@ mod tests {
             max_iter,
             ref_len: 0,
             use_perturb: 0,
-            palette_freq: 1.0,
-            palette_phase: 0.0,
-            _pad: 0.0,
+            _pad: 0,
         };
-        let plain = resources.render_offscreen(&device, &queue, &base, w, h);
+        let plain = resources.render_offscreen(&device, &queue, &base, &PAL, w, h);
 
         let orbit = crate::deep::reference_orbit(&center, max_iter, 128);
         resources.upload_orbit(&device, &queue, &orbit.points);
@@ -365,6 +486,7 @@ mod tests {
                 ref_len: orbit.points.len() as u32,
                 ..base
             },
+            &PAL,
             w,
             h,
         );
@@ -423,10 +545,9 @@ mod tests {
                 max_iter,
                 ref_len: orbit.points.len() as u32,
                 use_perturb: 1,
-                palette_freq: 1.0,
-                palette_phase: 0.0,
-                _pad: 0.0,
+                _pad: 0,
             },
+            &PAL,
             w,
             h,
         );
