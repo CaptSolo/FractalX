@@ -125,10 +125,13 @@ Resolved: macOS-only first (cross-platform later via wgpu/egui). UI toolkit: egu
 
 ## 10. Implementation status
 
-Built so far (escape-time module):
+Built so far:
 
 - **Mandelbrot explorer** — GPU-rendered (WGSL fragment shader), smooth pan/zoom anchored at the pointer, iteration slider to 100k, cyclic palette controls (§4.1, partially §4.5).
 - **PNG export with embedded bookmark** (§4.4/§4.5) — offscreen GPU render at arbitrary resolution; the complete view state travels in an iTXt chunk (versioned JSON, keyword `fractalx-bookmark`) and any exported PNG reopens to its exact view.
 - **Deep zoom to ~10^30** (§3.1) — perturbation with arbitrary-precision reference orbit (dashu), f32 delta iteration with rebasing on the GPU; orbit recomputed only when the view leaves its neighborhood. Verified by GPU tests (perturbation path must match the plain path where both are valid; a 10^-14 boundary view must show structure).
 
-Not yet started: progressive/cancellable refinement (§4.1 — deep views with high iteration counts currently render synchronously per frame), Julia companion pane, bookmarks journal, palette editor, other formulas, IFS/L-systems and natural/statistical modules, measurement tools.
+- **IFS module, first cut** (§3.2) — family selector in the UI; chaos-game rendering on the CPU (density histogram → log tone-map through the shared palette, cached so palette tweaks don't re-run the game); presets (Sierpinski, Barnsley fern, Heighway dragon); numeric affine-map editor with add/remove; viewport fitting to the attractor's bounding box. Bookmarks are v3 (family-tagged rule; v1/v2 still load as Mandelbrot). IFS PNG export renders on the CPU at full resolution with the point budget scaled to pixel count.
+- **Progressive rendering, first layer** (§4.1) — Mandelbrot renders through a resolution ladder (view changes restart at 1/4 resolution so interaction never stalls; each following frame climbs one rung to full resolution); the IFS chaos game accumulates a fixed point batch per frame, so the image "develops" and huge point counts never block the UI. Both render into textures; a view change simply abandons stale work (generation-by-key model).
+
+Not yet started: iteration chunking for escape-time (§4.1's second layer — a full-res pass at very high `max_iter` is still one long GPU dispatch; needs per-pixel state in storage buffers + compute shader); background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; L-systems; Julia companion pane; bookmarks journal; palette editor; other escape-time formulas; natural/statistical module; measurement tools.

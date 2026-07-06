@@ -1,6 +1,6 @@
 //! GPU Mandelbrot renderer, drawn into the egui canvas via a wgpu paint callback.
 
-use eframe::egui_wgpu::{self, wgpu};
+use eframe::egui_wgpu::wgpu;
 
 /// Shader uniforms. Layout must match `mandelbrot.wgsl`.
 #[repr(C)]
@@ -19,13 +19,13 @@ pub struct Uniforms {
 
 /// Wgpu resources shared across frames, stored in the egui renderer's
 /// `callback_resources` type map.
+///
+/// All rendering goes to offscreen Rgba8UnormSrgb textures: the live view
+/// paints a progressively-refined texture (resolution ladder in `main.rs`),
+/// and PNG export reads one back.
 pub struct RenderResources {
     pipeline: wgpu::RenderPipeline,
-    /// Same shader targeting Rgba8UnormSrgb, for offscreen PNG export.
-    export_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    bind_group: wgpu::BindGroup,
-    uniform_buffer: wgpu::Buffer,
     /// Perturbation reference orbit (vec2<f32> per iteration).
     orbit_buffer: wgpu::Buffer,
 }
@@ -92,17 +92,10 @@ fn build_pipeline(
 }
 
 impl RenderResources {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mandelbrot"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mandelbrot.wgsl").into()),
-        });
-
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mandelbrot uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -132,13 +125,6 @@ impl RenderResources {
         });
 
         let orbit_buffer = create_orbit_buffer(device, 2);
-        let bind_group = create_bind_group(
-            device,
-            &bind_group_layout,
-            &uniform_buffer,
-            &orbit_buffer,
-            "mandelbrot bg",
-        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mandelbrot pl"),
@@ -146,8 +132,7 @@ impl RenderResources {
             immediate_size: 0,
         });
 
-        let pipeline = build_pipeline(device, &shader, &pipeline_layout, target_format);
-        let export_pipeline = build_pipeline(
+        let pipeline = build_pipeline(
             device,
             &shader,
             &pipeline_layout,
@@ -156,10 +141,7 @@ impl RenderResources {
 
         Self {
             pipeline,
-            export_pipeline,
             bind_group_layout,
-            bind_group,
-            uniform_buffer,
             orbit_buffer,
         }
     }
@@ -174,15 +156,58 @@ impl RenderResources {
         let needed = (points.len().max(2) * 8) as u64;
         if self.orbit_buffer.size() < needed {
             self.orbit_buffer = create_orbit_buffer(device, points.len());
-            self.bind_group = create_bind_group(
-                device,
-                &self.bind_group_layout,
-                &self.uniform_buffer,
-                &self.orbit_buffer,
-                "mandelbrot bg",
-            );
         }
         queue.write_buffer(&self.orbit_buffer, 0, bytemuck::cast_slice(points));
+    }
+
+    /// Render `uniforms` into the given Rgba8UnormSrgb texture view and
+    /// submit. Non-blocking; used by both the live resolution ladder and
+    /// export.
+    pub fn render_to_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniforms: &Uniforms,
+        target: &wgpu::TextureView,
+    ) {
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mandelbrot uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        let bind_group = create_bind_group(
+            device,
+            &self.bind_group_layout,
+            &uniform_buffer,
+            &self.orbit_buffer,
+            "mandelbrot bg",
+        );
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mandelbrot pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([encoder.finish()]);
     }
 
     /// Render `uniforms` into a `width` x `height` offscreen texture and read
@@ -195,24 +220,6 @@ impl RenderResources {
         width: u32,
         height: u32,
     ) -> Vec<u8> {
-        // Fresh uniform buffer so the live view's buffer is untouched.
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        // Shares the live orbit buffer: the export view state matches the
-        // on-screen view, so the current orbit is the right one.
-        let bind_group = create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &uniform_buffer,
-            &self.orbit_buffer,
-            "export bg",
-        );
-
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export target"),
             size: wgpu::Extent3d {
@@ -228,6 +235,7 @@ impl RenderResources {
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
+        self.render_to_texture(device, queue, uniforms, &view);
 
         // Buffer rows must be padded to 256 bytes for texture-to-buffer copies.
         let bytes_per_row = (width * 4).next_multiple_of(256);
@@ -239,27 +247,6 @@ impl RenderResources {
         });
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("export pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.export_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -313,7 +300,7 @@ mod tests {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).expect("device");
 
-        let resources = RenderResources::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let resources = RenderResources::new(&device);
         let (w, h) = (128u32, 96u32);
         let uniforms = Uniforms {
             center: [-0.5, 0.0],
@@ -350,7 +337,7 @@ mod tests {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).expect("device");
 
-        let mut resources = RenderResources::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut resources = RenderResources::new(&device);
         let (w, h) = (96u32, 96u32);
         let center = crate::deep::BigComplex::from_f64(-0.65, 0.35);
         let max_iter = 300u32;
@@ -412,7 +399,7 @@ mod tests {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).expect("device");
 
-        let mut resources = RenderResources::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut resources = RenderResources::new(&device);
         let (w, h) = (64u32, 64u32);
 
         // A point on the boundary (Misiurewicz-like), viewed at 1e-14 scale.
@@ -456,38 +443,3 @@ mod tests {
     }
 }
 
-/// Per-frame paint callback carrying the uniforms for this view.
-pub struct MandelbrotCallback {
-    pub uniforms: Uniforms,
-}
-
-impl egui_wgpu::CallbackTrait for MandelbrotCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &RenderResources = callback_resources.get().unwrap();
-        queue.write_buffer(
-            &resources.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&self.uniforms),
-        );
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: eframe::egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
-    ) {
-        let resources: &RenderResources = callback_resources.get().unwrap();
-        render_pass.set_pipeline(&resources.pipeline);
-        render_pass.set_bind_group(0, &resources.bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
-    }
-}

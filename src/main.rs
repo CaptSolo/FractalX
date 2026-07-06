@@ -3,10 +3,17 @@
 
 mod deep;
 mod export;
+mod ifs;
 mod mandelbrot;
 
 use eframe::egui;
-use mandelbrot::{MandelbrotCallback, RenderResources, Uniforms};
+use eframe::wgpu;
+use mandelbrot::{RenderResources, Uniforms};
+
+/// Chaos-game points added per frame while an IFS render is filling in.
+const IFS_POINTS_PER_FRAME: u64 = 1_000_000;
+/// Coarsest rung of the Mandelbrot resolution ladder (1/4 resolution).
+const LADDER_START_LEVEL: u32 = 2;
 
 /// Once units-per-point drops below this, f32 in the shader is out of bits
 /// and rendering switches to the perturbation path.
@@ -14,17 +21,34 @@ const PERTURB_THRESHOLD: f64 = 1e-7;
 /// Hard zoom floor: below this even f32 pixel deltas underflow (~1e30 zoom).
 const MIN_UNITS_PER_POINT: f64 = 1e-32;
 
+/// Which fractal family is rendered, plus its family-specific rule.
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case")]
+enum FractalRule {
+    #[default]
+    Mandelbrot,
+    Ifs {
+        maps: Vec<ifs::AffineMap>,
+        points: u64,
+    },
+}
+
 /// Complete view state — the "bookmark": it fully determines a render.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ViewState {
     /// Complex-plane coordinates of the canvas center, arbitrary precision.
+    /// (Doubles as the world-space center for IFS, where f64 suffices.)
     #[serde(with = "center_serde")]
     center: deep::BigComplex,
     /// Complex units per screen point (zoom level).
     units_per_point: f64,
+    /// Escape-time iteration cap (unused by IFS, which has its own `points`).
     max_iter: u32,
     palette_freq: f32,
     palette_phase: f32,
+    /// Absent in v1/v2 bookmarks, which are always Mandelbrot.
+    #[serde(default)]
+    rule: FractalRule,
 }
 
 impl Default for ViewState {
@@ -35,6 +59,7 @@ impl Default for ViewState {
             max_iter: 300,
             palette_freq: 1.0,
             palette_phase: 0.0,
+            rule: FractalRule::Mandelbrot,
         }
     }
 }
@@ -85,14 +110,58 @@ struct OrbitCache {
     for_max_iter: u32,
 }
 
+/// Progressive IFS render: the chaos game fills the histogram over multiple
+/// frames (`done` of the target points so far); the tone-map is cheap and
+/// re-runs on palette changes without touching the histogram.
+struct IfsCache {
+    // Histogram key (a change invalidates everything)
+    center: [f64; 2],
+    units_per_pixel: f64,
+    size: [usize; 2],
+    maps: Vec<ifs::AffineMap>,
+    // Tone-map key
+    palette: (f32, f32),
+
+    game: ifs::ChaosGame,
+    done: u64,
+    hist: Vec<u32>,
+    texture: egui::TextureHandle,
+}
+
+/// Progressive Mandelbrot render: a resolution ladder. While the view
+/// changes, only the coarsest level is rendered (cheap); once it settles,
+/// each frame re-renders one level finer until full resolution.
+struct MandelProgressive {
+    /// Uniform bytes + full-resolution pixel size: identifies the view.
+    key: ([u8; 48], [u32; 2]),
+    /// Current rung: divisor is 1 << level, 0 = full resolution.
+    level: u32,
+    texture: wgpu::Texture,
+    texture_id: egui::TextureId,
+    texture_size: [u32; 2],
+}
+
+/// Text buffers for exact coordinate entry (Mandelbrot). While `dirty`, the
+/// user owns the strings; otherwise they mirror the current view each frame.
+#[derive(Default)]
+struct CoordEditor {
+    re: String,
+    im: String,
+    zoom: String,
+    dirty: bool,
+}
+
 struct App {
     view: ViewState,
+    coord_edit: CoordEditor,
     /// Last known canvas size in points; export reproduces this framing.
     canvas_size: egui::Vec2,
     export_width: u32,
     export_height: u32,
     status: Option<String>,
     orbit: Option<OrbitCache>,
+    ifs_cache: Option<IfsCache>,
+    mandel_prog: Option<MandelProgressive>,
 }
 
 impl App {
@@ -105,22 +174,39 @@ impl App {
             .renderer
             .write()
             .callback_resources
-            .insert(RenderResources::new(
-                &render_state.device,
-                render_state.target_format,
-            ));
+            .insert(RenderResources::new(&render_state.device));
         Self {
             view: ViewState::default(),
+            coord_edit: CoordEditor::default(),
             canvas_size: egui::vec2(980.0, 800.0),
             export_width: 2560,
             export_height: 1440,
             status: None,
             orbit: None,
+            ifs_cache: None,
+            mandel_prog: None,
         }
     }
 
     fn perturbation_active(&self) -> bool {
-        self.view.units_per_point < PERTURB_THRESHOLD
+        matches!(self.view.rule, FractalRule::Mandelbrot)
+            && self.view.units_per_point < PERTURB_THRESHOLD
+    }
+
+    /// Fit the viewport to the IFS attractor's bounding box.
+    fn fit_ifs_view(&mut self) {
+        let FractalRule::Ifs { maps, .. } = &self.view.rule else {
+            return;
+        };
+        if let Some([min_x, min_y, max_x, max_y]) = ifs::attractor_bbox(maps, 20_000) {
+            let w = (max_x - min_x).max(1e-6);
+            let h = (max_y - min_y).max(1e-6);
+            self.view.center =
+                deep::BigComplex::from_f64((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+            let upp_w = w / self.canvas_size.x.max(1.0) as f64;
+            let upp_h = h / self.canvas_size.y.max(1.0) as f64;
+            self.view.units_per_point = upp_w.max(upp_h) * 1.1;
+        }
     }
 
     /// Keep the reference orbit valid for the current view; recompute on the
@@ -205,30 +291,49 @@ impl App {
         };
 
         let result = (|| -> Result<String, String> {
-            let render_state = frame
-                .wgpu_render_state
-                .as_ref()
-                .ok_or("no wgpu render state")?;
             let (w, h) = (self.export_width.max(16), self.export_height.max(16));
-            let uniforms = self.uniforms_for_size(w as f64, h as f64);
 
-            let renderer = render_state.renderer.read();
-            let resources: &RenderResources = renderer
-                .callback_resources
-                .get()
-                .ok_or("render resources missing")?;
-            let pixels = resources.render_offscreen(
-                &render_state.device,
-                &render_state.queue,
-                &uniforms,
-                w,
-                h,
-            );
-            drop(renderer);
+            let pixels = match &self.view.rule {
+                FractalRule::Mandelbrot => {
+                    let render_state = frame
+                        .wgpu_render_state
+                        .as_ref()
+                        .ok_or("no wgpu render state")?;
+                    let uniforms = self.uniforms_for_size(w as f64, h as f64);
+                    let renderer = render_state.renderer.read();
+                    let resources: &RenderResources = renderer
+                        .callback_resources
+                        .get()
+                        .ok_or("render resources missing")?;
+                    resources.render_offscreen(
+                        &render_state.device,
+                        &render_state.queue,
+                        &uniforms,
+                        w,
+                        h,
+                    )
+                }
+                FractalRule::Ifs { maps, points } => {
+                    // Same vertical framing as the canvas; scale the point
+                    // budget with the pixel count so density is preserved.
+                    let world_h = self.view.units_per_point * self.canvas_size.y as f64;
+                    let view = ifs::IfsView {
+                        center: self.view.center.to_f64(),
+                        units_per_pixel: world_h / h as f64,
+                    };
+                    let canvas_px =
+                        (self.canvas_size.x * self.canvas_size.y).max(1.0) as f64;
+                    let scale = ((w * h) as f64 / canvas_px).max(1.0);
+                    let points = ((*points as f64 * scale) as u64).min(200_000_000);
+                    let hist =
+                        ifs::chaos_histogram(maps, points, view, w as usize, h as usize);
+                    ifs::tonemap_rgba(&hist, self.view.palette_freq, self.view.palette_phase)
+                }
+            };
 
             let bookmark = Bookmark {
                 app: "fractalx".to_owned(),
-                version: 2,
+                version: 3,
                 view: self.view.clone(),
             };
             let json = serde_json::to_string(&bookmark).map_err(|e| e.to_string())?;
@@ -253,22 +358,166 @@ impl App {
         self.status = Some(match result {
             Ok(bookmark) => {
                 self.view = bookmark.view;
-                self.orbit = None; // force a fresh reference orbit
+                self.orbit = None; // force fresh caches
+                self.ifs_cache = None;
                 format!("Restored view from {}", path.display())
             }
             Err(e) => format!("Load failed: {e}"),
         });
     }
 
+    /// Parse the coordinate editor and jump the view there.
+    fn apply_coords(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let zoom: f64 = self
+                .coord_edit
+                .zoom
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad zoom {:?}", self.coord_edit.zoom.trim()))?;
+            if !zoom.is_finite() || zoom <= 0.0 {
+                return Err("zoom must be positive".into());
+            }
+            let upp = (0.004 / zoom).clamp(MIN_UNITS_PER_POINT, 0.1);
+
+            let (re, im) = (self.coord_edit.re.trim(), self.coord_edit.im.trim());
+            // Precision to hold every typed digit, at least the zoom's needs.
+            let bits = (re.len().max(im.len()) * 4 + 64).max(deep::precision_for(upp));
+            let center = deep::BigComplex::from_decimal(re, im, bits)?;
+
+            self.view.center = center;
+            self.view.units_per_point = upp;
+            self.orbit = None;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.coord_edit.dirty = false;
+                self.status = Some("Jumped to entered coordinates".into());
+            }
+            Err(e) => self.status = Some(format!("Invalid coordinates: {e}")),
+        }
+    }
+
+    /// Switch to the given IFS preset: rule and viewport.
+    fn apply_preset(&mut self, preset: &ifs::Preset) {
+        let points = match &self.view.rule {
+            FractalRule::Ifs { points, .. } => *points,
+            _ => 1_000_000,
+        };
+        self.view.rule = FractalRule::Ifs {
+            maps: preset.maps.to_vec(),
+            points,
+        };
+        self.view.center = deep::BigComplex::from_f64(preset.center[0], preset.center[1]);
+        self.view.units_per_point = preset.units_per_point;
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        ui.heading("Mandelbrot");
+        ui.heading("FractalX");
         ui.add_space(8.0);
 
-        ui.label("Max iterations");
-        ui.add(
-            egui::Slider::new(&mut self.view.max_iter, 50..=100_000)
-                .logarithmic(true),
-        );
+        let was_ifs = matches!(self.view.rule, FractalRule::Ifs { .. });
+        let mut is_ifs = was_ifs;
+        egui::ComboBox::from_label("Family")
+            .selected_text(if is_ifs { "IFS (chaos game)" } else { "Mandelbrot" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut is_ifs, false, "Mandelbrot");
+                ui.selectable_value(&mut is_ifs, true, "IFS (chaos game)");
+            });
+        if is_ifs != was_ifs {
+            if is_ifs {
+                self.apply_preset(&ifs::PRESETS[0]);
+            } else {
+                self.view.rule = FractalRule::Mandelbrot;
+                self.view.center = deep::BigComplex::from_f64(-0.5, 0.0);
+                self.view.units_per_point = 0.004;
+                self.ifs_cache = None;
+            }
+            self.orbit = None;
+        }
+        ui.add_space(8.0);
+
+        match &mut self.view.rule {
+            FractalRule::Mandelbrot => {
+                ui.label("Max iterations");
+                ui.add(
+                    egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
+                );
+            }
+            FractalRule::Ifs { maps, points } => {
+                ui.label("Points");
+                ui.add(
+                    egui::Slider::new(points, 10_000..=20_000_000)
+                        .logarithmic(true),
+                );
+                ui.add_space(8.0);
+
+                ui.label("Presets");
+                let mut chosen: Option<&ifs::Preset> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for preset in ifs::PRESETS {
+                        if ui.small_button(preset.name).clicked() {
+                            chosen = Some(preset);
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label("Affine maps  (x' = a·x + b·y + e,  y' = c·x + d·y + f)");
+                let mut remove: Option<usize> = None;
+                for (i, m) in maps.iter_mut().enumerate() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{i}"));
+                        for (label, v) in [
+                            ("a", &mut m.a),
+                            ("b", &mut m.b),
+                            ("c", &mut m.c),
+                            ("d", &mut m.d),
+                        ] {
+                            ui.label(label);
+                            ui.add(egui::DragValue::new(v).speed(0.01).max_decimals(3));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.monospace(" ");
+                        for (label, v) in [("e", &mut m.e), ("f", &mut m.f)] {
+                            ui.label(label);
+                            ui.add(egui::DragValue::new(v).speed(0.01).max_decimals(3));
+                        }
+                        ui.label("w");
+                        ui.add(
+                            egui::DragValue::new(&mut m.weight)
+                                .speed(0.01)
+                                .range(0.0..=100.0)
+                                .max_decimals(3),
+                        );
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    maps.remove(i);
+                }
+                if ui.small_button("+ Add map").clicked() {
+                    maps.push(ifs::AffineMap {
+                        a: 0.5,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 0.5,
+                        e: 0.0,
+                        f: 0.0,
+                        weight: 1.0,
+                    });
+                }
+
+                if let Some(preset) = chosen {
+                    self.apply_preset(preset);
+                }
+            }
+        }
         ui.add_space(8.0);
 
         ui.label("Palette frequency");
@@ -278,12 +527,13 @@ impl App {
         ui.add_space(12.0);
 
         if ui.button("Reset view").clicked() {
-            self.view = ViewState {
-                palette_freq: self.view.palette_freq,
-                palette_phase: self.view.palette_phase,
-                max_iter: self.view.max_iter,
-                ..ViewState::default()
-            };
+            match self.view.rule {
+                FractalRule::Mandelbrot => {
+                    self.view.center = deep::BigComplex::from_f64(-0.5, 0.0);
+                    self.view.units_per_point = 0.004;
+                }
+                FractalRule::Ifs { .. } => self.fit_ifs_view(),
+            }
             self.orbit = None;
         }
 
@@ -293,15 +543,74 @@ impl App {
         let zoom = 0.004 / self.view.units_per_point;
         let digits = (zoom.log10().max(0.0) as usize) + 6;
         let [re, im] = self.view.center.to_decimal_digits(digits);
-        ui.monospace(format!("re  {re}"));
-        ui.monospace(format!("im  {im}"));
-        ui.monospace(format!("zoom  {zoom:.3e}"));
+        match self.view.rule {
+            FractalRule::Mandelbrot => {
+                // Editable position: the fields mirror the view until typed
+                // in, then hold the user's text until applied or reverted.
+                if !self.coord_edit.dirty {
+                    self.coord_edit.re = re;
+                    self.coord_edit.im = im;
+                    self.coord_edit.zoom = format!("{zoom:.3e}");
+                }
+                let ed = &mut self.coord_edit;
+                let mut apply = false;
+                for (label, buf) in
+                    [("re", &mut ed.re), ("im", &mut ed.im), ("zoom", &mut ed.zoom)]
+                {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{label:<4}"));
+                        let r = ui.add(
+                            egui::TextEdit::singleline(buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if r.changed() {
+                            ed.dirty = true;
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            apply = true;
+                        }
+                    });
+                }
+                if self.coord_edit.dirty {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Go").clicked() {
+                            apply = true;
+                        }
+                        if ui.small_button("Revert").clicked() {
+                            self.coord_edit.dirty = false;
+                        }
+                    });
+                }
+                if apply {
+                    self.apply_coords();
+                }
+            }
+            FractalRule::Ifs { .. } => {
+                ui.monospace(format!("x  {re}"));
+                ui.monospace(format!("y  {im}"));
+                ui.monospace(format!("zoom  {zoom:.3e}"));
+            }
+        }
+        if let (FractalRule::Ifs { points, .. }, Some(cache)) =
+            (&self.view.rule, &self.ifs_cache)
+        {
+            if cache.done < *points {
+                ui.add_space(4.0);
+                ui.small(format!(
+                    "rendering… {}%",
+                    100 * cache.done / (*points).max(1)
+                ));
+            }
+        }
         if self.perturbation_active() {
             ui.add_space(4.0);
             let pts = self.orbit.as_ref().map_or(0, |o| o.len);
             ui.small(format!("Deep zoom: perturbation ({pts} ref pts)"));
         }
-        if self.view.units_per_point <= MIN_UNITS_PER_POINT * 1.01 {
+        if matches!(self.view.rule, FractalRule::Mandelbrot)
+            && self.view.units_per_point <= MIN_UNITS_PER_POINT * 1.01
+        {
             ui.add_space(4.0);
             ui.colored_label(ui.visuals().warn_fg_color, "Zoom limit reached (~1e30).");
         }
@@ -343,7 +652,7 @@ impl App {
         ui.small("Drag to pan · scroll or pinch to zoom");
     }
 
-    fn canvas(&mut self, ui: &mut egui::Ui) {
+    fn canvas(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
@@ -380,17 +689,184 @@ impl App {
         }
 
         self.canvas_size = rect.size();
-        let uniforms = self.uniforms_for_size(rect.width() as f64, rect.height() as f64);
+        match self.view.rule {
+            FractalRule::Mandelbrot => self.paint_mandelbrot(ui, frame, rect),
+            FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
+        }
+    }
 
-        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+    /// Progressive Mandelbrot: render into a texture via a resolution ladder.
+    /// A view change restarts at 1/4 resolution (cheap enough to keep any
+    /// interaction fluid); each following frame re-renders one level finer.
+    fn paint_mandelbrot(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, rect: egui::Rect) {
+        let Some(render_state) = frame.wgpu_render_state.as_ref() else {
+            return;
+        };
+        let ppp = ui.ctx().pixels_per_point();
+        let full = [
+            ((rect.width() * ppp) as u32).clamp(16, 8192),
+            ((rect.height() * ppp) as u32).clamp(16, 8192),
+        ];
+        let uniforms = self.uniforms_for_size(rect.width() as f64, rect.height() as f64);
+        let mut key_bytes = [0u8; 48];
+        key_bytes.copy_from_slice(bytemuck::bytes_of(&uniforms));
+        let key = (key_bytes, full);
+
+        // Same view as last frame: climb one rung. New view: back to coarse.
+        let next_level = match &self.mandel_prog {
+            Some(p) if p.key == key => p.level.checked_sub(1),
+            _ => Some(LADDER_START_LEVEL),
+        };
+
+        if let Some(level) = next_level {
+            let div = 1u32 << level;
+            let size = [(full[0] / div).max(1), (full[1] / div).max(1)];
+            let device = &render_state.device;
+            let mut renderer = render_state.renderer.write();
+
+            let reuse = self
+                .mandel_prog
+                .as_ref()
+                .is_some_and(|p| p.texture_size == size);
+            if !reuse {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("mandelbrot progressive"),
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                let texture_id =
+                    renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+                if let Some(old) = self.mandel_prog.take() {
+                    renderer.free_texture(&old.texture_id);
+                }
+                self.mandel_prog = Some(MandelProgressive {
+                    key,
+                    level,
+                    texture,
+                    texture_id,
+                    texture_size: size,
+                });
+            }
+
+            let prog = self.mandel_prog.as_mut().expect("just ensured");
+            prog.key = key;
+            prog.level = level;
+            let view = prog.texture.create_view(&Default::default());
+            if let Some(resources) = renderer.callback_resources.get::<RenderResources>() {
+                resources.render_to_texture(device, &render_state.queue, &uniforms, &view);
+            }
+        }
+
+        if let Some(prog) = &self.mandel_prog {
+            ui.painter().image(
+                prog.texture_id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            if prog.level > 0 {
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    /// Progressive IFS: the chaos game accumulates a per-frame batch of
+    /// points into the cached histogram until the target count is reached
+    /// (the image "develops"). Palette changes only re-tone-map.
+    fn paint_ifs(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let FractalRule::Ifs { maps, points } = &self.view.rule else {
+            return;
+        };
+        let (maps, target) = (maps.clone(), *points);
+
+        let ppp = ui.ctx().pixels_per_point() as f64;
+        let w = ((rect.width() as f64 * ppp) as usize).clamp(16, 4096);
+        let h = ((rect.height() as f64 * ppp) as usize).clamp(16, 4096);
+        let center = self.view.center.to_f64();
+        let units_per_pixel = self.view.units_per_point / ppp;
+        let palette = (self.view.palette_freq, self.view.palette_phase);
+
+        // Anything that changes the histogram restarts the accumulation.
+        // (Lowering the target below what's done also restarts, to stay
+        // deterministic.)
+        let hist_valid = self.ifs_cache.as_ref().is_some_and(|c| {
+            c.center == center
+                && c.units_per_pixel == units_per_pixel
+                && c.size == [w, h]
+                && c.maps == maps
+                && c.done <= target
+        });
+        if !hist_valid {
+            let image = egui::ColorImage::filled([w, h], egui::Color32::BLACK);
+            let texture =
+                ui.ctx()
+                    .load_texture("ifs-render", image, egui::TextureOptions::LINEAR);
+            self.ifs_cache = Some(IfsCache {
+                center,
+                units_per_pixel,
+                size: [w, h],
+                maps: maps.clone(),
+                palette,
+                game: ifs::ChaosGame::new(),
+                done: 0,
+                hist: vec![0u32; w * h],
+                texture,
+            });
+        }
+
+        let cache = self.ifs_cache.as_mut().expect("just ensured");
+        let mut retonemap = cache.palette != palette;
+        if cache.done < target {
+            let batch = IFS_POINTS_PER_FRAME.min(target - cache.done);
+            cache.game.advance(
+                &maps,
+                ifs::IfsView {
+                    center,
+                    units_per_pixel,
+                },
+                w,
+                h,
+                &mut cache.hist,
+                batch,
+            );
+            cache.done += batch;
+            retonemap = true;
+        }
+        if retonemap {
+            let rgba = ifs::tonemap_rgba(&cache.hist, palette.0, palette.1);
+            cache.texture.set(
+                egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                egui::TextureOptions::LINEAR,
+            );
+            cache.palette = palette;
+        }
+
+        ui.painter().image(
+            cache.texture.id(),
             rect,
-            MandelbrotCallback { uniforms },
-        ));
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        if cache.done < target {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let frame: &eframe::Frame = frame;
         self.maintain_orbit(frame);
 
         egui::Panel::left("controls")
@@ -400,7 +876,49 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.canvas(ui));
+            .show(ui, |ui| self.canvas(ui, frame));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_bookmark_without_rule_loads_as_mandelbrot() {
+        let json = r#"{"app":"fractalx","version":2,"view":{
+            "center":["-0.75","0.1"],"units_per_point":1e-10,
+            "max_iter":5000,"palette_freq":1.0,"palette_phase":0.0}}"#;
+        let b: Bookmark = serde_json::from_str(json).unwrap();
+        assert!(matches!(b.view.rule, FractalRule::Mandelbrot));
+        assert_eq!(b.view.max_iter, 5000);
+    }
+
+    #[test]
+    fn v3_ifs_bookmark_round_trips() {
+        let view = ViewState {
+            rule: FractalRule::Ifs {
+                maps: ifs::PRESETS[1].maps.to_vec(),
+                points: 2_000_000,
+            },
+            center: deep::BigComplex::from_f64(0.25, 5.0),
+            units_per_point: 0.0145,
+            ..ViewState::default()
+        };
+        let json = serde_json::to_string(&Bookmark {
+            app: "fractalx".into(),
+            version: 3,
+            view,
+        })
+        .unwrap();
+        let back: Bookmark = serde_json::from_str(&json).unwrap();
+        match back.view.rule {
+            FractalRule::Ifs { maps, points } => {
+                assert_eq!(points, 2_000_000);
+                assert_eq!(maps, ifs::PRESETS[1].maps.to_vec());
+            }
+            _ => panic!("rule family lost in round trip"),
+        }
     }
 }
 
