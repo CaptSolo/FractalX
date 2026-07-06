@@ -95,3 +95,7 @@ formulas (Burning Ship, Multibrot, custom expressions).
 
 Rust · [wgpu](https://wgpu.rs) (Metal) · [egui/eframe](https://github.com/emilk/egui) ·
 [dashu](https://crates.io/crates/dashu) arbitrary precision · WGSL shaders
+
+## License
+
+[MIT](LICENSE)
