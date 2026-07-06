@@ -27,7 +27,8 @@ zooming in.*
   pixel's tiny delta in f32, with rebasing. Precision scales automatically
   with zoom depth. Works to ~10³⁰×, where f32 pixel deltas finally underflow.
 - **IFS explorer (chaos game)** — a second fractal family: iterated function
-  systems rendered as density plots. Ships with Sierpinski triangle, Barnsley
+  systems rendered as density plots, computed across all CPU cores with
+  deterministic output. Ships with Sierpinski triangle, Barnsley
   fern, and Heighway dragon presets; edit the affine maps live (or add your
   own) and watch the attractor respond. *Reset view* fits the viewport to the
   attractor.
@@ -109,7 +110,8 @@ more formulas (Burning Ship, Multibrot, custom expressions).
 ## Tech
 
 Rust · [wgpu](https://wgpu.rs) (Metal) · [egui/eframe](https://github.com/emilk/egui) ·
-[dashu](https://crates.io/crates/dashu) arbitrary precision · WGSL shaders
+[dashu](https://crates.io/crates/dashu) arbitrary precision ·
+[rayon](https://crates.io/crates/rayon) parallelism · WGSL shaders
 
 ## License
 

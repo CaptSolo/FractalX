@@ -80,11 +80,27 @@ pub struct IfsView {
     pub units_per_pixel: f64,
 }
 
-/// Resumable chaos game: carries the RNG and walker state so the histogram
-/// can be filled incrementally across frames (progressive rendering).
-/// Deterministic: a fixed seed makes any batch split produce the identical
-/// final histogram, so re-renders never flicker.
-pub struct ChaosGame {
+/// Number of independent chaos-game walkers. Fixed (not tied to the thread
+/// count) so results are identical on any machine; rayon spreads the walkers
+/// over available cores.
+const LANES: usize = 16;
+
+/// A walker's cumulative share of `total` plotted points. A pure function of
+/// the cumulative total, so any batch split advances each walker through the
+/// same sequence — histograms are batch-split invariant.
+fn lane_share(total: u64, lane: usize) -> u64 {
+    (total + (LANES - 1 - lane) as u64) / LANES as u64
+}
+
+/// View `&mut [u32]` as atomics for lock-free scatter increments.
+/// Sound: `AtomicU32` has the same layout as `u32`, and the exclusive borrow
+/// guarantees nothing else touches the data during the parallel phase.
+fn as_atomic(hist: &mut [u32]) -> &[std::sync::atomic::AtomicU32] {
+    unsafe { &*(hist as *mut [u32] as *const [std::sync::atomic::AtomicU32]) }
+}
+
+/// One independent chaos-game walker (its own RNG stream and position).
+struct Walker {
     rng: fastrand::Rng,
     x: f32,
     y: f32,
@@ -92,32 +108,27 @@ pub struct ChaosGame {
     warmup: u32,
 }
 
-impl ChaosGame {
-    pub fn new() -> Self {
+impl Walker {
+    fn new(lane: usize) -> Self {
         Self {
-            rng: fastrand::Rng::with_seed(0x5eed_f2ac_7a15_0001),
+            rng: fastrand::Rng::with_seed(0x5eed_f2ac_7a15_0001 + lane as u64),
             x: 0.0,
             y: 0.0,
             warmup: 32,
         }
     }
 
-    /// Advance by `points` plotted points, accumulating into `hist`
-    /// (`width*height`, same view for every batch).
-    pub fn advance(
+    fn advance(
         &mut self,
         maps: &[AffineMap],
+        total_weight: f32,
         view: IfsView,
         width: usize,
         height: usize,
-        hist: &mut [u32],
+        hist: &[std::sync::atomic::AtomicU32],
         points: u64,
     ) {
-        debug_assert_eq!(hist.len(), width * height);
-        let total_weight: f32 = maps.iter().map(|m| m.weight.max(0.0)).sum();
-        if maps.is_empty() || total_weight <= 0.0 {
-            return;
-        }
+        use std::sync::atomic::Ordering::Relaxed;
 
         // World -> pixel transform (y up in world, down in pixels).
         let upp = view.units_per_pixel;
@@ -155,9 +166,61 @@ impl ChaosGame {
             let px = (self.x as f64 - ox) / upp;
             let py = (oy - self.y as f64) / upp;
             if px >= 0.0 && py >= 0.0 && (px as usize) < width && (py as usize) < height {
-                hist[py as usize * width + px as usize] += 1;
+                hist[py as usize * width + px as usize].fetch_add(1, Relaxed);
             }
         }
+    }
+}
+
+/// Resumable, parallel chaos game: a fixed set of independent walkers filling
+/// one histogram (rayon over walkers, atomic scatter adds). Deterministic:
+/// fixed seeds, a fixed lane count, and cumulative work-splitting make any
+/// batch split — on any number of threads — produce the identical histogram.
+pub struct ChaosGame {
+    walkers: Vec<Walker>,
+    /// Cumulative points requested so far.
+    total: u64,
+}
+
+impl ChaosGame {
+    pub fn new() -> Self {
+        Self {
+            walkers: (0..LANES).map(Walker::new).collect(),
+            total: 0,
+        }
+    }
+
+    /// Advance by `points` plotted points, accumulating into `hist`
+    /// (`width*height`, same view for every batch).
+    pub fn advance(
+        &mut self,
+        maps: &[AffineMap],
+        view: IfsView,
+        width: usize,
+        height: usize,
+        hist: &mut [u32],
+        points: u64,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(hist.len(), width * height);
+        let total_weight: f32 = maps.iter().map(|m| m.weight.max(0.0)).sum();
+        if maps.is_empty() || total_weight <= 0.0 {
+            return;
+        }
+
+        let old_total = self.total;
+        self.total += points;
+        let new_total = self.total;
+        let atomic_hist = as_atomic(hist);
+
+        self.walkers
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(lane, walker)| {
+                let n = lane_share(new_total, lane) - lane_share(old_total, lane);
+                walker.advance(maps, total_weight, view, width, height, atomic_hist, n);
+            });
     }
 }
 
@@ -297,6 +360,38 @@ mod tests {
             game.advance(maps, view, 64, 64, &mut hist, batch);
         }
         assert_eq!(hist, one_shot, "batch split changed the result");
+    }
+
+    // Dev benchmark (not run by default): parallel vs single-thread speedup.
+    // Run with: cargo test --release bench_chaos_speedup -- --ignored --nocapture
+    // Speedup is scatter-bound: ~3x when the attractor fills the frame,
+    // ~2x when concentrated (atomic contention on hot pixels).
+    #[test]
+    #[ignore]
+    fn bench_chaos_speedup() {
+        let view = IfsView { center: [0.5, 0.43], units_per_pixel: 1.2 / 2160.0 };
+        let t = std::time::Instant::now();
+        let _ = chaos_histogram(PRESETS[0].maps, 20_000_000, view, 3840, 2160);
+        let par = t.elapsed();
+        let single = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| {
+            let t = std::time::Instant::now();
+            let _ = chaos_histogram(PRESETS[0].maps, 20_000_000, view, 3840, 2160);
+            t.elapsed()
+        });
+        println!("parallel: {par:?}  single-thread: {single:?}  speedup: {:.1}x",
+            single.as_secs_f64() / par.as_secs_f64());
+    }
+
+    #[test]
+    fn result_independent_of_thread_count() {
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| chaos_histogram(PRESETS[1].maps, 100_000, sierpinski_view(), 64, 64))
+        };
+        assert_eq!(run(1), run(8), "histogram depends on thread count");
     }
 
     #[test]
