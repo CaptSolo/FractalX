@@ -30,7 +30,7 @@ const MIN_UNITS_PER_POINT: f64 = 1e-32;
 enum FractalRule {
     #[default]
     Mandelbrot,
-    BurningShip,
+    Tricorn,
     Multibrot {
         power: u32,
     },
@@ -48,7 +48,7 @@ impl FractalRule {
     fn display_name(&self) -> &'static str {
         match self {
             FractalRule::Mandelbrot => "Mandelbrot",
-            FractalRule::BurningShip => "Burning Ship",
+            FractalRule::Tricorn => "Tricorn",
             FractalRule::Multibrot { .. } => "Multibrot",
             FractalRule::Ifs { .. } => "IFS (chaos game)",
         }
@@ -58,7 +58,7 @@ impl FractalRule {
     fn home_view(&self) -> ([f64; 2], f64) {
         match self {
             FractalRule::Mandelbrot => ([-0.5, 0.0], 0.004),
-            FractalRule::BurningShip => ([-0.4, -0.4], 0.005),
+            FractalRule::Tricorn => ([-0.25, 0.0], 0.005),
             FractalRule::Multibrot { .. } => ([0.0, 0.0], 0.004),
             FractalRule::Ifs { .. } => ([0.5, 0.43], 0.0016),
         }
@@ -318,7 +318,7 @@ impl App {
         };
 
         let (formula, power) = match self.view.rule {
-            FractalRule::BurningShip => (mandelbrot::FORMULA_BURNING_SHIP, 2),
+            FractalRule::Tricorn => (mandelbrot::FORMULA_TRICORN, 2),
             FractalRule::Multibrot { power } => {
                 (mandelbrot::FORMULA_MULTIBROT, power.max(2))
             }
@@ -360,7 +360,7 @@ impl App {
 
             let pixels = match &self.view.rule {
                 FractalRule::Mandelbrot
-                | FractalRule::BurningShip
+                | FractalRule::Tricorn
                 | FractalRule::Multibrot { .. } => {
                     let render_state = frame
                         .wgpu_render_state
@@ -489,7 +489,7 @@ impl App {
         let mut selected = std::mem::discriminant(&self.view.rule);
         let choices: [FractalRule; 4] = [
             FractalRule::Mandelbrot,
-            FractalRule::BurningShip,
+            FractalRule::Tricorn,
             FractalRule::Multibrot { power: 3 },
             FractalRule::Ifs {
                 maps: vec![],
@@ -527,7 +527,7 @@ impl App {
         ui.add_space(8.0);
 
         match &mut self.view.rule {
-            FractalRule::Mandelbrot | FractalRule::BurningShip => {
+            FractalRule::Mandelbrot | FractalRule::Tricorn => {
                 ui.label("Max iterations");
                 ui.add(
                     egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),

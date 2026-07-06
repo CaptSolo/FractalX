@@ -6,7 +6,7 @@ use eframe::egui_wgpu::wgpu;
 
 /// Escape-time formula selector; values match the shader's `formula` switch.
 pub const FORMULA_MANDELBROT: u32 = 0;
-pub const FORMULA_BURNING_SHIP: u32 = 1;
+pub const FORMULA_TRICORN: u32 = 1;
 pub const FORMULA_MULTIBROT: u32 = 2;
 
 /// Iteration (data pass) uniforms. Layout must match `mandelbrot.wgsl`.
@@ -691,7 +691,7 @@ mod tests {
         );
     }
 
-    /// Burning Ship and Multibrot must render structured images distinct
+    /// Tricorn and Multibrot must render structured images distinct
     /// from the Mandelbrot set.
     #[test]
     fn alternate_formulas_render_distinct_images() {
@@ -725,10 +725,10 @@ mod tests {
         };
 
         let mandel = render(FORMULA_MANDELBROT, 2);
-        let ship = render(FORMULA_BURNING_SHIP, 2);
+        let tricorn = render(FORMULA_TRICORN, 2);
         let multi = render(FORMULA_MULTIBROT, 4);
 
-        for (name, img) in [("burning ship", &ship), ("multibrot", &multi)] {
+        for (name, img) in [("tricorn", &tricorn), ("multibrot", &multi)] {
             assert_ne!(&mandel, img, "{name} identical to mandelbrot");
             // Has both interior (black) and escaped (colored) pixels.
             let black = img

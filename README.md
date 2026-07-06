@@ -18,10 +18,11 @@ zooming in.*
 
 ## Features
 
-- **GPU-rendered Mandelbrot explorer** — smooth pan (drag) and zoom
-  (scroll/pinch, anchored at the pointer), iteration depth up to 100,000,
-  adjustable cyclic color palette, and exact coordinate entry (paste a
-  40-digit deep-zoom location and jump straight there).
+- **GPU-rendered escape-time explorer** — Mandelbrot, Tricorn (Mandelbar),
+  and Multibrot (power 2–8): smooth pan (drag) and zoom (scroll/pinch,
+  anchored at the pointer), iteration depth up to 100,000, adjustable cyclic
+  color palette, and exact coordinate entry (paste a 40-digit deep-zoom
+  location and jump straight there).
 - **Deep zoom via perturbation theory** — a single reference orbit is computed
   on the CPU in arbitrary-precision arithmetic; the GPU iterates only each
   pixel's tiny delta in f32, with rebasing. Precision scales automatically
@@ -65,7 +66,7 @@ cargo test
 
 | Action | Input |
 |---|---|
-| Switch fractal family | *Family* dropdown (Mandelbrot / IFS) |
+| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / IFS) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |
@@ -105,7 +106,7 @@ implementation status.
 
 Planned next: visual drag-handle editing of IFS maps, a hover-linked Julia
 companion pane, a bookmarks journal with thumbnails, palette editor, L-systems,
-more formulas (Burning Ship, Multibrot, custom expressions).
+custom formula expressions.
 
 ## Tech
 

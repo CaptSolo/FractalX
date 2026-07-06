@@ -1,4 +1,4 @@
-// Escape-time renderer (Mandelbrot, Burning Ship, Multibrot), split into:
+// Escape-time renderer (Mandelbrot, Tricorn, Multibrot), split into:
 //
 //  1. Data pass: iterates each pixel and writes the smooth (continuous)
 //     iteration count into an R32Float texture; interior pixels write -1.
@@ -22,7 +22,7 @@ struct Uniforms {
     max_iter: u32,
     ref_len: u32,           // number of valid entries in ref_orbit
     use_perturb: u32,       // 0 = plain path, 1 = perturbation path
-    formula: u32,           // 0 = Mandelbrot, 1 = Burning Ship, 2 = Multibrot
+    formula: u32,           // 0 = Mandelbrot, 1 = Tricorn, 2 = Multibrot
     power: u32,             // Multibrot exponent (>= 2)
     _pad: u32,
 };
@@ -68,9 +68,9 @@ fn smooth_iter(iter: f32, z2: f32) -> f32 {
 // One plain-path step: z' = F(z) + c for the selected formula.
 fn step_plain(z: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
     switch u.formula {
-        case 1u: { // Burning Ship: fold into the first quadrant, then square
-            let a = abs(z);
-            return cmul(a, a) + c;
+        case 1u: { // Tricorn (Mandelbar): conjugate, then square
+            let zc = vec2<f32>(z.x, -z.y);
+            return cmul(zc, zc) + c;
         }
         case 2u: { // Multibrot: z^power + c (integer power, repeated mul)
             var w = z;
