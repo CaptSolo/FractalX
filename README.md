@@ -8,9 +8,10 @@ Linux is untested but expected to work (wgpu/Vulkan).
 
 Zoom into the Mandelbrot set down to **~10³⁰×** magnification — far beyond
 double precision — build iterated function systems (Barnsley fern, Sierpinski
-triangle, or your own affine maps), grow L-system curves and plants, and
-export any view as a PNG that carries its exact coordinates inside, so every
-image can be reopened right where it was taken.
+triangle, or your own affine maps), grow L-system curves and plants, raise
+fBm noise into mountains and clouds, and export any view as a PNG that
+carries its exact coordinates inside, so every image can be reopened right
+where it was taken.
 
 ![FractalX exploring the Mandelbrot set](assets/full_ui_view.png)
 
@@ -52,6 +53,10 @@ zooming in.*
 - **Strange attractors** — Clifford and de Jong maps as glowing density
   plots, computed across all CPU cores with fully deterministic output;
   four presets plus live numeric editing of the map parameters.
+- **Fractal terrain & clouds** — statistical self-similarity: fBm noise
+  landscapes with a roughness ↔ fractal-dimension control, rendered as
+  hill-shaded heightmaps (or turbulent clouds) through the palette; an
+  infinite, seedable plane you can pan and zoom like any other family.
 - **Progressive rendering** — interaction never stalls: the Mandelbrot view
   renders through a resolution ladder (coarse immediately, sharpening in
   place), and density images (IFS, attractors) "develop" as points accumulate
@@ -102,7 +107,7 @@ cargo test
 
 | Action | Input |
 |---|---|
-| Switch fractal family | *Family* dropdown (Mandelbrot / Multibrot / Julia / IFS / L-system / Strange attractor) |
+| Switch fractal family | *Family* dropdown (Mandelbrot / Multibrot / Julia / IFS / L-system / Strange attractor / Terrain) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |

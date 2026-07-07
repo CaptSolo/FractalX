@@ -12,6 +12,7 @@ mod ifs;
 mod lsystem;
 mod mandelbrot;
 mod palette;
+mod terrain;
 
 use eframe::egui;
 use eframe::wgpu;
@@ -60,6 +61,7 @@ enum FractalRule {
         params: [f64; 4],
         points: u64,
     },
+    Terrain(terrain::Params),
 }
 
 impl FractalRule {
@@ -69,6 +71,7 @@ impl FractalRule {
             FractalRule::Ifs { .. }
                 | FractalRule::LSystem { .. }
                 | FractalRule::Attractor { .. }
+                | FractalRule::Terrain(_)
         )
     }
 
@@ -80,6 +83,8 @@ impl FractalRule {
             FractalRule::Ifs { .. } => "IFS (chaos game)",
             FractalRule::LSystem { .. } => "L-system",
             FractalRule::Attractor { .. } => "Strange attractor",
+            FractalRule::Terrain(p) if p.clouds => "Clouds",
+            FractalRule::Terrain(_) => "Terrain",
         }
     }
 
@@ -94,6 +99,8 @@ impl FractalRule {
             FractalRule::LSystem { .. } => ([0.0, 0.0], 0.01),
             // Placeholder; attractor views are fitted to the orbit's bounds.
             FractalRule::Attractor { .. } => ([0.0, 0.0], 0.006),
+            // ~8 base-octave noise features across a ~800pt canvas.
+            FractalRule::Terrain(_) => ([0.0, 0.0], 0.01),
         }
     }
 }
@@ -241,6 +248,17 @@ struct AttractorCache {
     texture: egui::TextureHandle,
 }
 
+/// Cached terrain/clouds render: a single deterministic full-frame pass,
+/// re-run when the parameters, view, size, or palette change.
+struct TerrainCache {
+    params: terrain::Params,
+    center: [f64; 2],
+    units_per_pixel: f64,
+    size: [usize; 2],
+    palette: (palette::Palette, f32, f32),
+    texture: egui::TextureHandle,
+}
+
 /// Cached L-system render: turtle segments (recomputed only when the rule
 /// changes) plus the last rasterized image (recomputed when the view, size,
 /// or palette changes — rasterizing is cheap next to expansion).
@@ -346,6 +364,7 @@ struct App {
     ifs_cache: Option<IfsCache>,
     lsys_cache: Option<LsysCache>,
     attr_cache: Option<AttractorCache>,
+    terrain_cache: Option<TerrainCache>,
     mandel_prog: Option<MandelProgressive>,
     show_julia_pane: bool,
     /// Pinned Julia-preview c (J toggles); None = track the cursor.
@@ -380,6 +399,7 @@ impl App {
             ifs_cache: None,
             lsys_cache: None,
             attr_cache: None,
+            terrain_cache: None,
             mandel_prog: None,
             show_julia_pane: true,
             julia_pin: None,
@@ -678,6 +698,23 @@ impl App {
                         self.view.palette_phase,
                     )
                 }
+                FractalRule::Terrain(params) => {
+                    // Same vertical framing as the canvas.
+                    let world_h = self.view.units_per_point * self.canvas_size.y as f64;
+                    let view = ifs::IfsView {
+                        center: self.view.center.to_f64(),
+                        units_per_pixel: world_h / h as f64,
+                    };
+                    terrain::render_rgba(
+                        params,
+                        view,
+                        w as usize,
+                        h as usize,
+                        self.view.palette,
+                        self.view.palette_freq,
+                        self.view.palette_phase,
+                    )
+                }
                 FractalRule::LSystem {
                     axiom,
                     rules,
@@ -943,7 +980,7 @@ impl App {
 
         // Family selection: a discriminant-only copy drives the combo box.
         let mut selected = std::mem::discriminant(&self.view.rule);
-        let choices: [FractalRule; 6] = [
+        let choices: [FractalRule; 7] = [
             FractalRule::Mandelbrot,
             FractalRule::Multibrot { power: 3 },
             FractalRule::Julia { c: [-0.8, 0.156] },
@@ -962,6 +999,7 @@ impl App {
                 params: [0.0; 4],
                 points: 0,
             },
+            FractalRule::Terrain(terrain::Params::default()),
         ];
         egui::ComboBox::from_label("Family")
             .selected_text(self.view.rule.display_name())
@@ -993,6 +1031,7 @@ impl App {
                 self.ifs_cache = None;
                 self.lsys_cache = None;
                 self.attr_cache = None;
+                self.terrain_cache = None;
             }
             self.orbit = None;
             self.coord_edit.dirty = false;
@@ -1254,6 +1293,28 @@ impl App {
                 } else if edited {
                     self.fit_attractor_view();
                 }
+            }
+            FractalRule::Terrain(params) => {
+                ui.horizontal(|ui| {
+                    ui.label("Seed");
+                    ui.add_sized(
+                        [96.0, ui.spacing().interact_size.y],
+                        egui::DragValue::new(&mut params.seed).speed(1),
+                    );
+                    if ui.small_button("Random").clicked() {
+                        params.seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(1);
+                    }
+                });
+                ui.label("Roughness  (H)");
+                ui.add(egui::Slider::new(&mut params.hurst, 0.05..=1.0));
+                ui.small(format!("fractal dimension D = 3 − H ≈ {:.2}", 3.0 - params.hurst));
+                ui.label("Octaves");
+                ui.add(egui::Slider::new(&mut params.octaves, 1..=12));
+                ui.add_space(4.0);
+                ui.checkbox(&mut params.clouds, "Clouds (turbulence)");
             }
         }
         ui.add_space(8.0);
@@ -1630,6 +1691,7 @@ impl App {
             FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
             FractalRule::LSystem { .. } => self.paint_lsystem(ui, rect),
             FractalRule::Attractor { .. } => self.paint_attractor(ui, rect),
+            FractalRule::Terrain(_) => self.paint_terrain(ui, rect),
             _ => self.paint_mandelbrot(ui, frame, rect, dragging),
         }
 
@@ -2172,6 +2234,82 @@ impl App {
         }
     }
 
+    /// Terrain/clouds: one deterministic full-frame render (rayon-parallel),
+    /// re-run only when parameters, view, size, or palette change.
+    fn paint_terrain(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let FractalRule::Terrain(params) = &self.view.rule else {
+            return;
+        };
+        let params = *params;
+
+        let ppp = ui.ctx().pixels_per_point() as f64;
+        let w = ((rect.width() as f64 * ppp) as usize).clamp(16, 4096);
+        let h = ((rect.height() as f64 * ppp) as usize).clamp(16, 4096);
+        let center = self.view.center.to_f64();
+        let units_per_pixel = self.view.units_per_point / ppp;
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
+
+        let valid = self.terrain_cache.as_ref().is_some_and(|c| {
+            c.params == params
+                && c.center == center
+                && c.units_per_pixel == units_per_pixel
+                && c.size == [w, h]
+                && c.palette == palette
+        });
+        if !valid {
+            let rgba = terrain::render_rgba(
+                &params,
+                ifs::IfsView {
+                    center,
+                    units_per_pixel,
+                },
+                w,
+                h,
+                palette.0,
+                palette.1,
+                palette.2,
+            );
+            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            match &mut self.terrain_cache {
+                Some(cache) => {
+                    cache.texture.set(image, egui::TextureOptions::LINEAR);
+                    cache.params = params;
+                    cache.center = center;
+                    cache.units_per_pixel = units_per_pixel;
+                    cache.size = [w, h];
+                    cache.palette = palette;
+                }
+                None => {
+                    let texture = ui.ctx().load_texture(
+                        "terrain-render",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.terrain_cache = Some(TerrainCache {
+                        params,
+                        center,
+                        units_per_pixel,
+                        size: [w, h],
+                        palette,
+                        texture,
+                    });
+                }
+            }
+        }
+
+        let cache = self.terrain_cache.as_ref().expect("just ensured");
+        ui.painter().image(
+            cache.texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
     /// Cached L-system render: segments rebuild only when the rule changes;
     /// the image re-rasterizes when the view, size, or palette changes.
     fn paint_lsystem(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -2395,6 +2533,29 @@ mod tests {
             let back: Bookmark = serde_json::from_str(&json).unwrap();
             assert!(back.view.rule == rule, "rule lost in round trip: {json}");
         }
+    }
+
+    #[test]
+    fn terrain_bookmark_round_trips() {
+        let rule = FractalRule::Terrain(terrain::Params {
+            seed: 42,
+            hurst: 0.65,
+            octaves: 9,
+            clouds: true,
+        });
+        let view = ViewState {
+            rule: rule.clone(),
+            ..ViewState::default()
+        };
+        let json = serde_json::to_string(&Bookmark {
+            app: "fractalx".into(),
+            version: 3,
+            view,
+        })
+        .unwrap();
+        assert!(json.contains(r#""family":"terrain""#), "{json}");
+        let back: Bookmark = serde_json::from_str(&json).unwrap();
+        assert!(back.view.rule == rule, "rule lost in round trip: {json}");
     }
 
     #[test]

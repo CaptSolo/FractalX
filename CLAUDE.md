@@ -38,6 +38,11 @@ built vs. pending; keep it updated when a milestone lands.
   interpretation (`F G f g + - [ ]`), CPU rasterization (Liang–Barsky clip +
   DDA) colored by arc position through the shared palette. Fully
   deterministic (no RNG). Bookmark family tag: `l_system`.
+- `src/terrain.rs` — fractal terrain/clouds: fBm over seeded hash-based
+  Perlin noise (pure function of (seed, point) — deterministic, infinite
+  plane). Hurst exponent = roughness control; terrain hill-shades from
+  screen-space neighbor slopes, clouds map turbulence. Rayon over rows.
+  Bookmark family tag: `terrain`.
 - `src/palette.rs` — cosine-gradient palettes (`a + b·cos(2π(c·x + d))`):
   named presets plus a `Custom(Coeffs)` variant from the sidebar editor; one
   coefficient table drives both the WGSL color pass and the CPU tone-maps.
