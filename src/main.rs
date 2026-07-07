@@ -716,8 +716,9 @@ impl App {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        ui.add_space(12.0);
         ui.heading("FractalX");
-        ui.add_space(8.0);
+        ui.add_space(16.0);
 
         // Family selection: a discriminant-only copy drives the combo box.
         let mut selected = std::mem::discriminant(&self.view.rule);
@@ -1033,6 +1034,8 @@ impl App {
             }
         }
         ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
         ui.label("Palette");
         egui::ComboBox::from_id_salt("palette-preset")
@@ -1046,21 +1049,6 @@ impl App {
         ui.add(egui::Slider::new(&mut self.view.palette_freq, 0.1..=8.0).logarithmic(true));
         ui.label("Palette phase");
         ui.add(egui::Slider::new(&mut self.view.palette_phase, 0.0..=1.0));
-        ui.add_space(12.0);
-
-        if ui.button("Reset view").clicked() {
-            match &self.view.rule {
-                FractalRule::Ifs { .. } => self.fit_ifs_view(),
-                FractalRule::LSystem { .. } => self.fit_lsystem_view(),
-                FractalRule::Attractor { .. } => self.fit_attractor_view(),
-                _ => {
-                    let (center, upp) = self.view.rule.home_view();
-                    self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
-                    self.view.units_per_point = upp;
-                }
-            }
-            self.orbit = None;
-        }
 
         ui.add_space(12.0);
         ui.separator();
@@ -1116,6 +1104,22 @@ impl App {
             ui.monospace(format!("y  {im}"));
             ui.monospace(format!("zoom  {zoom:.3e}"));
         }
+
+        ui.add_space(8.0);
+        if ui.button("Reset view").clicked() {
+            match &self.view.rule {
+                FractalRule::Ifs { .. } => self.fit_ifs_view(),
+                FractalRule::LSystem { .. } => self.fit_lsystem_view(),
+                FractalRule::Attractor { .. } => self.fit_attractor_view(),
+                _ => {
+                    let (center, upp) = self.view.rule.home_view();
+                    self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
+                    self.view.units_per_point = upp;
+                }
+            }
+            self.orbit = None;
+        }
+
         let density_progress = match (&self.view.rule, &self.ifs_cache, &self.attr_cache) {
             (FractalRule::Ifs { points, .. }, Some(cache), _) => Some((cache.done, *points)),
             (FractalRule::Attractor { points, .. }, _, Some(cache)) => {
@@ -1186,6 +1190,7 @@ impl App {
         ui.separator();
         ui.add_space(4.0);
         ui.small("Drag to pan · scroll or pinch to zoom");
+        ui.add_space(12.0);
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -1704,7 +1709,13 @@ impl eframe::App for App {
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(260.0)
-            .show(ui, |ui| self.controls(ui, frame));
+            .show(ui, |ui| {
+                // Scroll instead of clipping when the window is too short
+                // for the full control stack.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.controls(ui, frame));
+            });
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
