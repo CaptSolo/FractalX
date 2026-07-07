@@ -2,7 +2,9 @@
 
 A fast, native, cross-platform fractal explorer for macOS and Windows,
 written in Rust with GPU rendering (wgpu: Metal / DirectX 12 / Vulkan) and an
-egui interface. Linux is untested but expected to work (wgpu/Vulkan).
+egui interface. 
+
+Linux is untested but expected to work (wgpu/Vulkan).
 
 Zoom into the Mandelbrot set down to **~10³⁰×** magnification — far beyond
 double precision — build iterated function systems (Barnsley fern, Sierpinski
@@ -135,7 +137,7 @@ from it, so panning stays smooth even at extreme depth.
 
 Early but functional prototype — part of a larger concept for exploring
 self-similarity (escape-time fractals, IFS/L-systems, and statistical
-fractals); see [CONCEPT.md](CONCEPT.md) for the full vision and current
+fractals); see [CONCEPT.md](CONCEPT.md) for the vision and current
 implementation status.
 
 Planned next: visual drag-handle editing of IFS maps, a bookmarks journal
