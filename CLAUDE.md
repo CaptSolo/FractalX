@@ -1,14 +1,15 @@
 # FractalX
 
-Desktop fractal explorer (macOS-first): Rust + wgpu + egui (eframe). Vision,
+Desktop fractal explorer (cross-platform: macOS + Windows; development
+happens on macOS): Rust + wgpu + egui (eframe). Vision,
 scope, and implementation status live in `CONCEPT.md` — §10 tracks what is
 built vs. pending; keep it updated when a milestone lands.
 
 ## Commands
 
 - Build: `cargo build` · Run: `cargo run --release` (debug builds render slowly)
-- Test: `cargo test` — includes headless GPU tests (need a Metal adapter; no
-  GPU-less CI). `cargo test --release bench_chaos_speedup -- --ignored
+- Test: `cargo test` — includes headless GPU tests (need a GPU adapter —
+  Metal here on macOS; no GPU-less CI). `cargo test --release bench_chaos_speedup -- --ignored
   --nocapture` runs the chaos-game benchmark.
 - The binary is `fractalx`; check liveness with `pgrep -x fractalx`
 
@@ -81,9 +82,9 @@ built vs. pending; keep it updated when a milestone lands.
   `bind_group_layouts: &[Some(..)]`, `PollType::wait_indefinitely()`,
   `Context::egui_wants_keyboard_input` not `wants_keyboard_input`). When
   unsure, read the vendored sources in `~/.cargo/registry/src/`.
-- **Cross-pipeline float jitter is normal**: Metal schedules float ops
-  differently in fragment vs compute variants of the same WGSL, so ~1% of
-  boundary pixels escape one iteration apart. Tests tolerate it
+- **Cross-pipeline float jitter is normal**: GPU drivers (Metal here)
+  schedule float ops differently in fragment vs compute variants of the same
+  WGSL, so ~1% of boundary pixels escape one iteration apart. Tests tolerate it
   (`perturbation_matches_plain_path`, `chunked_compute_matches_fragment_pass`)
   — don't tighten them to exact equality across pipelines. Chunk *resumption*
   (multi-dispatch vs single dispatch, same pipeline) IS bit-exact and tested

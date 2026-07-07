@@ -1,7 +1,8 @@
 # FractalX
 
-A fast, native fractal explorer for macOS, written in Rust with GPU rendering
-(wgpu/Metal) and an egui interface.
+A fast, native, cross-platform fractal explorer for macOS and Windows,
+written in Rust with GPU rendering (wgpu: Metal / DirectX 12 / Vulkan) and an
+egui interface. Linux is untested but expected to work (wgpu/Vulkan).
 
 Zoom into the Mandelbrot set down to **~10³⁰×** magnification — far beyond
 double precision — build iterated function systems (Barnsley fern, Sierpinski
@@ -63,7 +64,9 @@ zooming in.*
 
 ## Building
 
-Requires a Rust toolchain (stable) on macOS.
+Requires a stable Rust toolchain. On Windows, the MSVC toolchain also needs
+"Build Tools for Visual Studio" with the *Desktop development with C++*
+workload (for `link.exe`).
 
 ```sh
 cargo run --release
@@ -71,8 +74,8 @@ cargo run --release
 
 Debug builds work but render noticeably slower; use `--release` for exploring.
 
-Run the test suite (includes headless GPU tests, so a Metal-capable machine is
-needed):
+Run the test suite (includes headless GPU tests, so a machine with a GPU
+adapter is needed):
 
 ```sh
 cargo test
@@ -102,8 +105,9 @@ thousands of iterations.
 
 ## How deep zoom works
 
-Standard f32 GPU math runs out of bits at about 10⁴–10⁵× zoom, and Metal has
-no shader f64. FractalX uses the modern deep-zoom technique instead:
+Standard f32 GPU math runs out of bits at about 10⁴–10⁵× zoom, and GPU
+shaders (WGSL) have no f64. FractalX uses the modern deep-zoom technique
+instead:
 
 1. The view center is tracked in arbitrary-precision floats
    ([dashu](https://crates.io/crates/dashu)), with precision growing with zoom
@@ -128,7 +132,8 @@ with thumbnails, custom formula expressions.
 
 ## Tech
 
-Rust · [wgpu](https://wgpu.rs) (Metal) · [egui/eframe](https://github.com/emilk/egui) ·
+Rust · [wgpu](https://wgpu.rs) (Metal / DirectX 12 / Vulkan) ·
+[egui/eframe](https://github.com/emilk/egui) ·
 [dashu](https://crates.io/crates/dashu) arbitrary precision ·
 [rayon](https://crates.io/crates/rayon) parallelism · WGSL shaders
 

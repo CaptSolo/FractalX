@@ -34,7 +34,7 @@ Three families, chosen to show self-similarity from three different angles:
 ### 3.1 Escape-time fractals (implicit self-similarity)
 - Mandelbrot set, Julia sets, Burning Ship, Multibrot, and **user-defined complex formulas** (small expression language, compiled to GPU shader).
 - Smooth/continuous coloring, interior coloring, orbit traps.
-- **Deep zoom**: perturbation theory — arbitrary-precision reference orbit on the CPU, per-pixel f32 delta iteration with rebasing on the GPU — for zooms to ~10^30. (Metal has no shader f64, so f32+perturbation carries all depth beyond the plain path's ~10^4.)
+- **Deep zoom**: perturbation theory — arbitrary-precision reference orbit on the CPU, per-pixel f32 delta iteration with rebasing on the GPU — for zooms to ~10^30. (GPU shaders (WGSL) have no f64, so f32+perturbation carries all depth beyond the plain path's ~10^4.)
 - Live **Mandelbrot ↔ Julia duality**: hover a point in the Mandelbrot set, see its Julia set update in a companion pane.
 
 ### 3.2 IFS & L-systems (explicit self-similarity)
@@ -74,7 +74,7 @@ Palette editor (gradient stops, cyclic palettes, palette import), applied post-h
 
 ## 5. Architecture sketch
 
-**Chosen stack: Rust + wgpu + egui (eframe), macOS-first.** Rationale: native performance for CPU-side arbitrary-precision math, first-class GPU compute for rendering, single-binary distribution on macOS (primary platform), and a language well-suited to a long-lived hobby codebase. Arbitrary precision is `dashu` (pure Rust — no C toolchain dependency; its decimal↔binary conversion is ~1 ulp, absorbed by 64 guard bits of precision headroom). Alternatives considered: C++/OpenGL (more deep-zoom reference material, worse ergonomics), rug/MPFR (faster bignums, GMP build dependency).
+**Chosen stack: Rust + wgpu + egui (eframe), macOS-first — since borne out: the same code builds and runs on Windows unchanged.** Rationale: native performance for CPU-side arbitrary-precision math, first-class GPU compute for rendering, single-binary distribution on every platform, and a language well-suited to a long-lived hobby codebase. Arbitrary precision is `dashu` (pure Rust — no C toolchain dependency; its decimal↔binary conversion is ~1 ulp, absorbed by 64 guard bits of precision headroom). Alternatives considered: C++/OpenGL (more deep-zoom reference material, worse ergonomics), rug/MPFR (faster bignums, GMP build dependency).
 
 ```
 ┌────────────────────────────────────────────┐
@@ -121,7 +121,7 @@ Key contracts:
 - How far to take the custom-formula language (full expression parser → shader codegen is a project in itself)?
 - Should the journal be per-project files or a single library database?
 
-Resolved: macOS-only first (cross-platform later via wgpu/egui). UI toolkit: egui via eframe.
+Resolved: macOS-only first, cross-platform via wgpu/egui — realized: Windows builds work unchanged (Linux untested). UI toolkit: egui via eframe.
 
 ## 10. Implementation status
 
