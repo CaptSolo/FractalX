@@ -18,7 +18,7 @@ zooming in.*
 
 ## Features
 
-- **GPU-rendered escape-time explorer** — Mandelbrot, Tricorn (Mandelbar),
+- **GPU-rendered escape-time explorer** — Mandelbrot,
   Multibrot (power 2–8), and Julia sets (pick the constant numerically or
   from classic presets): smooth pan (drag) and zoom (scroll/pinch, anchored
   at the pointer), iteration depth up to 100,000, and exact coordinate entry
@@ -82,12 +82,13 @@ cargo test
 
 | Action | Input |
 |---|---|
-| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / Julia / IFS / L-system / Strange attractor) |
+| Switch fractal family | *Family* dropdown (Mandelbrot / Multibrot / Julia / IFS / L-system / Strange attractor) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |
 | Iterations / points | sliders in the left panel |
-| Change colors | *Palette* dropdown + frequency/phase sliders |
+| Change colors | *Palette* dropdown, frequency/phase sliders, *Edit coefficients* for custom palettes |
+| Julia preview (Mandelbrot) | hover the canvas; `J` pins/unpins the point; click the pane to open it as a full Julia view |
 | Edit an IFS | preset buttons, then tweak the affine-map coefficients |
 | Edit an L-system | preset buttons, then edit axiom/rules/angle/generations |
 | Export image | set resolution, *Export PNG…* |

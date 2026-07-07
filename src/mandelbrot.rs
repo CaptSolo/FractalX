@@ -5,8 +5,9 @@
 use eframe::egui_wgpu::wgpu;
 
 /// Escape-time formula selector; values match the shader's `formula` switch.
+// Formula 1 was Tricorn (removed); 2/3 keep their values so existing
+// Multibrot/Julia bookmarks stay valid.
 pub const FORMULA_MANDELBROT: u32 = 0;
-pub const FORMULA_TRICORN: u32 = 1;
 pub const FORMULA_MULTIBROT: u32 = 2;
 pub const FORMULA_JULIA: u32 = 3;
 
@@ -707,7 +708,7 @@ mod tests {
         );
     }
 
-    /// Tricorn and Multibrot must render structured images distinct
+    /// Multibrot and Julia must render structured images distinct
     /// from the Mandelbrot set.
     #[test]
     fn alternate_formulas_render_distinct_images() {
@@ -742,16 +743,11 @@ mod tests {
         };
 
         let mandel = render(FORMULA_MANDELBROT, 2, [0.0, 0.0]);
-        let tricorn = render(FORMULA_TRICORN, 2, [0.0, 0.0]);
         let multi = render(FORMULA_MULTIBROT, 4, [0.0, 0.0]);
         // c inside the main cardioid: connected Julia set with interior.
         let julia = render(FORMULA_JULIA, 2, [-0.4, 0.6]);
 
-        for (name, img) in [
-            ("tricorn", &tricorn),
-            ("multibrot", &multi),
-            ("julia", &julia),
-        ] {
+        for (name, img) in [("multibrot", &multi), ("julia", &julia)] {
             assert_ne!(&mandel, img, "{name} identical to mandelbrot");
             // Has both interior (black) and escaped (colored) pixels.
             let black = img

@@ -43,7 +43,7 @@ built vs. pending; keep it updated when a milestone lands.
   bookmarks default to it via `#[serde(default)]`; presets serialize by name,
   `Custom` with its coefficients.
 - `src/export.rs` — PNG with the bookmark embedded as an iTXt chunk.
-- Formulas: Mandelbrot / Tricorn / Multibrot / Julia share one shader
+- Formulas: Mandelbrot / Multibrot / Julia share one shader
   iteration core (`step_plain` switch); adding a formula touches the shader
   switch, the `FractalRule` enum, and `uniforms_for_size` only. (Julia also
   seeds `z` from the pixel via `initial_state` and iterates a constant
@@ -61,7 +61,7 @@ built vs. pending; keep it updated when a milestone lands.
   of the cumulative total (batch-split invariance). Changing any of these
   changes rendered output for identical bookmarks.
 - **Perturbation is Mandelbrot-only** by design (the z² delta algebra doesn't
-  carry to Tricorn/Multibrot); other formulas warn in the UI past ~3e4 zoom.
+  carry to Multibrot/Julia); other formulas warn in the UI past ~3e4 zoom.
 - The reference orbit recomputes only when the view drifts > half a screen
   from the reference or needs more iterations — per-frame recompute janks
   panning.
@@ -100,7 +100,7 @@ built vs. pending; keep it updated when a milestone lands.
 - **Bookmark compatibility contract**: v1 (`center: [f64;2]`) and v2 (no
   `rule` field → Mandelbrot) bookmarks and the legacy `selfsame-bookmark` PNG
   keyword must keep loading (`center_serde`, `#[serde(default)] rule`,
-  `LEGACY_BOOKMARK_KEYWORD`). Removed family tags (e.g. `burning_ship`) fail
+  `LEGACY_BOOKMARK_KEYWORD`). Removed family tags (`burning_ship`, `tricorn`) fail
   to load with a clear error — acceptable.
 - Screenshots of the running app are unavailable to agents (no screen-recording
   permission); verify rendering via the headless GPU tests instead.

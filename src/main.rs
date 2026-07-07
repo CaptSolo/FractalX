@@ -33,7 +33,6 @@ const MIN_UNITS_PER_POINT: f64 = 1e-32;
 enum FractalRule {
     #[default]
     Mandelbrot,
-    Tricorn,
     Multibrot {
         power: u32,
     },
@@ -72,7 +71,6 @@ impl FractalRule {
     fn display_name(&self) -> &'static str {
         match self {
             FractalRule::Mandelbrot => "Mandelbrot",
-            FractalRule::Tricorn => "Tricorn",
             FractalRule::Multibrot { .. } => "Multibrot",
             FractalRule::Julia { .. } => "Julia",
             FractalRule::Ifs { .. } => "IFS (chaos game)",
@@ -85,7 +83,6 @@ impl FractalRule {
     fn home_view(&self) -> ([f64; 2], f64) {
         match self {
             FractalRule::Mandelbrot => ([-0.5, 0.0], 0.004),
-            FractalRule::Tricorn => ([-0.25, 0.0], 0.005),
             FractalRule::Multibrot { .. } => ([0.0, 0.0], 0.004),
             FractalRule::Julia { .. } => ([0.0, 0.0], 0.004),
             FractalRule::Ifs { .. } => ([0.5, 0.43], 0.0016),
@@ -490,7 +487,6 @@ impl App {
         };
 
         let (formula, power, julia_c) = match self.view.rule {
-            FractalRule::Tricorn => (mandelbrot::FORMULA_TRICORN, 2, [0.0; 2]),
             FractalRule::Multibrot { power } => {
                 (mandelbrot::FORMULA_MULTIBROT, power.max(2), [0.0; 2])
             }
@@ -578,7 +574,6 @@ impl App {
 
             let pixels = match &self.view.rule {
                 FractalRule::Mandelbrot
-                | FractalRule::Tricorn
                 | FractalRule::Multibrot { .. }
                 | FractalRule::Julia { .. } => {
                     let render_state = frame
@@ -797,9 +792,8 @@ impl App {
 
         // Family selection: a discriminant-only copy drives the combo box.
         let mut selected = std::mem::discriminant(&self.view.rule);
-        let choices: [FractalRule; 7] = [
+        let choices: [FractalRule; 6] = [
             FractalRule::Mandelbrot,
-            FractalRule::Tricorn,
             FractalRule::Multibrot { power: 3 },
             FractalRule::Julia { c: [-0.8, 0.156] },
             FractalRule::Ifs {
@@ -863,12 +857,6 @@ impl App {
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.show_julia_pane, "Julia preview (hover)");
                 ui.small("J pins / unpins the preview point");
-            }
-            FractalRule::Tricorn => {
-                ui.label("Max iterations");
-                ui.add(
-                    egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
-                );
             }
             FractalRule::Multibrot { power } => {
                 ui.label("Max iterations");
@@ -2004,17 +1992,32 @@ impl eframe::App for App {
 
         // Exact width: content (e.g. focused full-width text fields) must
         // never widen the panel over the canvas.
-        let panel_frame = egui::Frame::side_top_panel(ui.style())
-            .inner_margin(egui::Margin::symmetric(16, 8));
+        // Asymmetric: roomy on the text side, snug where the scrollbar
+        // meets the canvas edge.
+        let panel_frame = egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+            left: 16,
+            right: 4,
+            top: 8,
+            bottom: 8,
+        });
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(260.0)
             .frame(panel_frame)
             .show(ui, |ui| {
                 // Scroll instead of clipping when the window is too short
-                // for the full control stack.
+                // for the full control stack. Solid (not floating) bars:
+                // floating bars overlay the content on hover; solid ones get
+                // their own reserved column, plus a gap before the content.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                ui.spacing_mut().scroll.bar_inner_margin = 12.0;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    // Always reserve the bar column so the content width
+                    // doesn't shift when scrolling becomes necessary.
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
                     .show(ui, |ui| self.controls(ui, frame));
             });
 
