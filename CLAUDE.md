@@ -36,10 +36,12 @@ built vs. pending; keep it updated when a milestone lands.
   interpretation (`F G f g + - [ ]`), CPU rasterization (Liang–Barsky clip +
   DDA) colored by arc position through the shared palette. Fully
   deterministic (no RNG). Bookmark family tag: `l_system`.
-- `src/palette.rs` — named cosine-gradient presets (`a + b·cos(2π(c·x + d))`);
-  one coefficient table drives both the WGSL color pass and the CPU IFS
-  tone-map. `Classic` must stay bit-identical to the original palette
-  (tested) — old bookmarks default to it via `#[serde(default)]`.
+- `src/palette.rs` — cosine-gradient palettes (`a + b·cos(2π(c·x + d))`):
+  named presets plus a `Custom(Coeffs)` variant from the sidebar editor; one
+  coefficient table drives both the WGSL color pass and the CPU tone-maps.
+  `Classic` must stay bit-identical to the original palette (tested) — old
+  bookmarks default to it via `#[serde(default)]`; presets serialize by name,
+  `Custom` with its coefficients.
 - `src/export.rs` — PNG with the bookmark embedded as an iTXt chunk.
 - Formulas: Mandelbrot / Tricorn / Multibrot / Julia share one shader
   iteration core (`step_plain` switch); adding a formula touches the shader

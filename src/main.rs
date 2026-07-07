@@ -514,6 +514,43 @@ impl App {
         }
     }
 
+    /// A horizontal strip sampling the palette over one color cycle,
+    /// with the frequency/phase sliders applied — live editor feedback.
+    fn palette_preview(&self, ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 14.0),
+            egui::Sense::hover(),
+        );
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        const STEPS: usize = 64;
+        let step_w = rect.width() / STEPS as f32;
+        for i in 0..STEPS {
+            let t = (i as f32 + 0.5) / STEPS as f32;
+            let [r, g, b] =
+                self.view
+                    .palette
+                    .eval(t, self.view.palette_freq, self.view.palette_phase);
+            let x = rect.left() + i as f32 * step_w;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x, rect.top()),
+                    // Slight overlap hides seams from rounding.
+                    egui::pos2(x + step_w + 0.5, rect.bottom()),
+                ),
+                0.0,
+                egui::Color32::from_rgb(r, g, b),
+            );
+        }
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            ui.visuals().window_stroke(),
+            egui::StrokeKind::Outside,
+        );
+    }
+
     fn palette_uniforms(&self) -> mandelbrot::PaletteUniforms {
         let [a, b, c, d] = self.view.palette.coeffs();
         mandelbrot::PaletteUniforms {
@@ -1093,10 +1130,39 @@ impl App {
                     ui.selectable_value(&mut self.view.palette, p, p.name());
                 }
             });
+        ui.add_space(4.0);
+        self.palette_preview(ui);
         ui.label("Palette frequency");
         ui.add(egui::Slider::new(&mut self.view.palette_freq, 0.1..=8.0).logarithmic(true));
         ui.label("Palette phase");
         ui.add(egui::Slider::new(&mut self.view.palette_phase, 0.0..=1.0));
+        egui::CollapsingHeader::new("Edit coefficients")
+            .id_salt("palette-editor")
+            .show(ui, |ui| {
+                // Editing any coefficient turns the palette into `Custom`
+                // seeded with the current preset's values.
+                let mut rows = self.view.palette.coeffs();
+                let mut changed = false;
+                for (label, row) in [("a", 0), ("b", 1), ("c", 2), ("d", 3)] {
+                    ui.horizontal(|ui| {
+                        ui.monospace(label);
+                        for channel in 0..3 {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut rows[row][channel])
+                                        .speed(0.01)
+                                        .max_decimals(3),
+                                )
+                                .changed();
+                        }
+                    });
+                }
+                ui.small("color = a + b·cos(2π(c·x + d)) per RGB channel");
+                if changed {
+                    self.view.palette =
+                        palette::Palette::Custom(palette::Coeffs::from_rows(rows));
+                }
+            });
 
         ui.add_space(12.0);
         ui.separator();

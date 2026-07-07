@@ -26,9 +26,10 @@ zooming in.*
   exploring the Mandelbrot set, a corner overlay previews the Julia set for
   the point under the cursor, live.
 - **Color palettes** — six cosine-gradient presets (Classic, Sunset, Fire,
-  Electric, Pastel, Grayscale) with frequency and phase controls, shared by
-  the escape-time and IFS renderers. Palette changes re-colorize instantly —
-  the fractal is never re-computed.
+  Electric, Pastel, Grayscale) with frequency and phase controls, a live
+  gradient preview, and a coefficient editor for building custom palettes —
+  all shared by every renderer. Palette changes re-colorize instantly; the
+  fractal is never re-computed.
 - **Deep zoom via perturbation theory** — a single reference orbit is computed
   on the CPU in arbitrary-precision arithmetic; the GPU iterates only each
   pixel's tiny delta in f32, with rebasing. Precision scales automatically
@@ -122,7 +123,7 @@ fractals); see [CONCEPT.md](CONCEPT.md) for the full vision and current
 implementation status.
 
 Planned next: visual drag-handle editing of IFS maps, a bookmarks journal
-with thumbnails, palette editor, custom formula expressions.
+with thumbnails, custom formula expressions.
 
 ## Tech
 

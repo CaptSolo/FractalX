@@ -6,9 +6,33 @@
 //! The GPU color pass and the CPU IFS tone-map both evaluate this formula
 //! from the same coefficients.
 
-/// A predefined palette. Serialized by name in bookmarks; absent in older
-/// bookmarks, which default to `Classic` (the original palette).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// User-editable cosine-gradient coefficients: one row per `a`/`b`/`c`/`d`,
+/// RGB columns.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Coeffs {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub c: [f32; 3],
+    pub d: [f32; 3],
+}
+
+impl Coeffs {
+    /// From the vec4-padded rows `coeffs()` returns (padding dropped).
+    pub fn from_rows(rows: [[f32; 4]; 4]) -> Self {
+        let row = |r: [f32; 4]| [r[0], r[1], r[2]];
+        Self {
+            a: row(rows[0]),
+            b: row(rows[1]),
+            c: row(rows[2]),
+            d: row(rows[3]),
+        }
+    }
+}
+
+/// A palette: a named preset, or `Custom` coefficients from the editor.
+/// Presets serialize by name in bookmarks (absent in older bookmarks, which
+/// default to `Classic`); `Custom` carries its coefficients.
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Palette {
     #[default]
@@ -18,9 +42,15 @@ pub enum Palette {
     Electric,
     Pastel,
     Grayscale,
+    Custom(Coeffs),
+}
+
+const fn pad(v: [f32; 3]) -> [f32; 4] {
+    [v[0], v[1], v[2], 0.0]
 }
 
 impl Palette {
+    /// The named presets (the combo box list; `Custom` is entered by editing).
     pub const ALL: [Palette; 6] = [
         Palette::Classic,
         Palette::Sunset,
@@ -38,6 +68,7 @@ impl Palette {
             Palette::Electric => "Electric",
             Palette::Pastel => "Pastel",
             Palette::Grayscale => "Grayscale",
+            Palette::Custom(_) => "Custom",
         }
     }
 
@@ -81,6 +112,7 @@ impl Palette {
                 [1.0, 1.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 0.0],
             ],
+            Palette::Custom(k) => [pad(k.a), pad(k.b), pad(k.c), pad(k.d)],
         }
     }
 
@@ -121,5 +153,20 @@ mod tests {
         assert_eq!(serde_json::to_string(&Palette::Classic).unwrap(), r#""classic""#);
         let p: Palette = serde_json::from_str(r#""grayscale""#).unwrap();
         assert_eq!(p, Palette::Grayscale);
+    }
+
+    #[test]
+    fn custom_coefficients_round_trip() {
+        let custom = Palette::Custom(Coeffs {
+            a: [0.6, 0.5, 0.4],
+            b: [0.3, 0.4, 0.5],
+            c: [1.0, 2.0, 0.5],
+            d: [0.1, 0.2, 0.3],
+        });
+        let json = serde_json::to_string(&custom).unwrap();
+        let back: Palette = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, custom);
+        // Coefficients drive rendering exactly as edited.
+        assert_eq!(custom.coeffs()[2], [1.0, 2.0, 0.5, 0.0]);
     }
 }
