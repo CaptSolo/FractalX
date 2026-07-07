@@ -56,6 +56,10 @@ zooming in.*
   renders through a resolution ladder (coarse immediately, sharpening in
   place), and density images (IFS, attractors) "develop" as points accumulate
   each frame.
+- **Bookmarks journal** — save any view, then browse the gallery in the main
+  window (*Bookmarks…* in the sidebar); click a thumbnail to return to that
+  exact view. Entries persist across runs (each is itself a small
+  bookmark-PNG in the app-data folder).
 - **PNG export with embedded bookmarks** — renders offscreen at any resolution
   (up to 16K), independent of the window. The complete view state (center
   coordinates at full precision, zoom, iterations, palette) is embedded in the
@@ -107,6 +111,7 @@ cargo test
 | Julia preview (Mandelbrot) | hover the canvas; `J` pins/unpins the point; click the pane to open it as a full Julia view |
 | Edit an IFS | preset buttons, then tweak the affine-map coefficients |
 | Edit an L-system | preset buttons, then edit axiom/rules/angle/generations |
+| Save / revisit views | *Save view to journal*; *Bookmarks…* shows the gallery (Esc to go back) |
 | Export image | set resolution, *Export PNG…* |
 | Reopen an exported view | *Open PNG bookmark…* |
 | Back to the full set / fit attractor | *Reset view* |
@@ -140,8 +145,8 @@ self-similarity (escape-time fractals, IFS/L-systems, and statistical
 fractals); see [CONCEPT.md](CONCEPT.md) for the vision and current
 implementation status.
 
-Planned next: visual drag-handle editing of IFS maps, a bookmarks journal
-with thumbnails, custom formula expressions.
+Planned next: visual drag-handle editing of IFS maps, custom formula
+expressions.
 
 ## Tech
 

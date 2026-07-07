@@ -167,6 +167,14 @@ Built so far:
   that serializes with its coefficients in bookmarks (named presets still
   serialize by name; old bookmarks load unchanged). Applies everywhere the
   shared palette does, still without recomputation.
+- **Bookmarks journal** (§4.4, first cut) — a bookmark mode for the main
+  window: *Bookmarks…* swaps the canvas for a scrollable wrapped thumbnail
+  grid (Esc or *Back to fractal* returns; opening an entry returns too).
+  Each entry is a small bookmark-PNG (thumbnail with the full view state in
+  its iTXt chunk — the export format, just smaller) stored in the per-user
+  app-data directory; *Save view to journal* renders the thumbnail with the
+  canvas framing, clicking an entry reopens the exact view, ✕ deletes it.
+  No new file format: the journal is a folder of tiny reopenable exports.
 - **Hover-linked Julia preview** (§3.1 duality) — while exploring the
   Mandelbrot set, a corner overlay renders the Julia set for the c under the
   cursor in real time (small fixed-iteration GPU render, re-run only when c
@@ -176,4 +184,4 @@ Built so far:
   view" button) promotes the displayed c to the full Julia family view.
 - **Iteration chunking** (§4.1 second layer) — above 2048 iterations, a ladder rung renders via a compute shader that advances every pixel by 2048 iterations per frame, persisting per-pixel state in a storage buffer (`ceil(max_iter/chunk)` dispatches guarantee completion — no readback). No single dispatch can stall the GPU at 100k iterations. Chunk resumption is bit-exact vs. a single dispatch (tested); fragment and compute variants differ by driver-level float jitter on ~1% boundary pixels (tolerated in tests).
 
-Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; bookmarks journal; palette import and gradient-stop editing (the shipped editor is coefficient-based); custom formula expressions; natural/statistical module; measurement tools.
+Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; journal polish (starter gallery of curated locations, names/notes on entries); palette import and gradient-stop editing (the shipped editor is coefficient-based); custom formula expressions; natural/statistical module; measurement tools.

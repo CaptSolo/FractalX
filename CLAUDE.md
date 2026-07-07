@@ -18,7 +18,8 @@ built vs. pending; keep it updated when a milestone lands.
 - `src/main.rs` — app shell, `ViewState`/`FractalRule` (the "bookmark": fully
   determines a render), interaction, progressive-render scheduling (resolution
   ladder, chunk jobs, pan reprojection, IFS batching), orbit cache, export/load
-  UI, coordinate entry.
+  UI, coordinate entry, bookmarks journal (a folder of thumbnail-sized
+  bookmark-PNGs in the per-user app-data dir — same format as exports).
 - `src/mandelbrot.rs` — escape-time wgpu pipelines. Two-pass: data pass writes
   smooth iteration counts to an R32Float texture (fragment for low `max_iter`,
   chunked compute above `CHUNK_ITERS`), color pass maps data through the
@@ -93,6 +94,9 @@ built vs. pending; keep it updated when a milestone lands.
   `resizable(false)` still lets content widen the panel — a focused
   `desired_width(f32::INFINITY)` TextEdit expands it over the canvas. The
   controls panel uses `exact_size` for this reason; keep it.
+- **egui's bundled fonts miss common icon glyphs** (e.g. `✕` U+2715 renders
+  as tofu). Don't put icon glyphs on buttons; paint them (see `cross_button`,
+  which draws the ✕ with line segments like egui's own window close button).
 - **naga return analysis**: a WGSL function whose body ends in an
   always-returning `loop` still needs a trailing unreachable `return`.
 - **dashu base conversion is ~1 ulp inexact**: bookmark decimal round trips are

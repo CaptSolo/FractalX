@@ -295,6 +295,35 @@ struct MandelProgressive {
     texture_size: [u32; 2],
 }
 
+/// A small delete/remove button with a painted ✕ — drawn with line segments
+/// (like egui's own window close button) because the bundled fonts render
+/// cross glyphs as tofu.
+fn cross_button(ui: &mut egui::Ui) -> egui::Response {
+    let response = ui.add(egui::Button::new("").min_size(egui::vec2(20.0, 16.0)));
+    let rect = response.rect;
+    let half = (rect.width().min(rect.height()) * 0.22).max(3.0);
+    let c = rect.center();
+    let stroke = ui.style().interact(&response).fg_stroke;
+    ui.painter().line_segment(
+        [c + egui::vec2(-half, -half), c + egui::vec2(half, half)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [c + egui::vec2(half, -half), c + egui::vec2(-half, half)],
+        stroke,
+    );
+    response
+}
+
+/// One saved view in the journal: a thumbnail PNG on disk with the bookmark
+/// embedded (the same format as full exports — the journal is just a folder
+/// of small bookmark-PNGs).
+struct JournalEntry {
+    path: std::path::PathBuf,
+    family: &'static str,
+    texture: egui::TextureHandle,
+}
+
 /// Text buffers for exact coordinate entry (Mandelbrot). While `dirty`, the
 /// user owns the strings; otherwise they mirror the current view each frame.
 #[derive(Default)]
@@ -322,6 +351,11 @@ struct App {
     /// Pinned Julia-preview c (J toggles); None = track the cursor.
     julia_pin: Option<[f64; 2]>,
     julia_pane: Option<JuliaPane>,
+    /// None until first scanned; then the gallery, newest first.
+    journal: Option<Vec<JournalEntry>>,
+    /// Bookmark mode: the main canvas shows the journal gallery instead of
+    /// the fractal.
+    journal_mode: bool,
 }
 
 impl App {
@@ -350,6 +384,8 @@ impl App {
             show_julia_pane: true,
             julia_pin: None,
             julia_pane: None,
+            journal: None,
+            journal_mode: false,
         }
     }
 
@@ -564,19 +600,10 @@ impl App {
         }
     }
 
-    fn export_png(&mut self, frame: &eframe::Frame) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name("fractalx.png")
-            .save_file()
-        else {
-            return;
-        };
-
-        let result = (|| -> Result<String, String> {
-            let (w, h) = (self.export_width.max(16), self.export_height.max(16));
-
-            let pixels = match &self.view.rule {
+    /// Render the current view offscreen at the given size — the shared core
+    /// of PNG export and journal thumbnails.
+    fn render_pixels(&self, frame: &eframe::Frame, w: u32, h: u32) -> Result<Vec<u8>, String> {
+        Ok(match &self.view.rule {
                 FractalRule::Mandelbrot
                 | FractalRule::Multibrot { .. }
                 | FractalRule::Julia { .. } => {
@@ -674,15 +701,32 @@ impl App {
                         self.view.palette_phase,
                     )
                 }
-            };
+            })
+    }
 
-            let bookmark = Bookmark {
-                app: "fractalx".to_owned(),
-                version: 3,
-                view: self.view.clone(),
-            };
-            let json = serde_json::to_string(&bookmark).map_err(|e| e.to_string())?;
-            export::save_png(&path, w, h, &pixels, &json)?;
+    /// The current view as versioned bookmark JSON.
+    fn bookmark_json(&self) -> Result<String, String> {
+        let bookmark = Bookmark {
+            app: "fractalx".to_owned(),
+            version: 3,
+            view: self.view.clone(),
+        };
+        serde_json::to_string(&bookmark).map_err(|e| e.to_string())
+    }
+
+    fn export_png(&mut self, frame: &eframe::Frame) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .set_file_name("fractalx.png")
+            .save_file()
+        else {
+            return;
+        };
+
+        let result = (|| -> Result<String, String> {
+            let (w, h) = (self.export_width.max(16), self.export_height.max(16));
+            let pixels = self.render_pixels(frame, w, h)?;
+            export::save_png(&path, w, h, &pixels, &self.bookmark_json()?)?;
             Ok(format!("Exported {w}x{h} to {}", path.display()))
         })();
 
@@ -702,13 +746,116 @@ impl App {
         });
         self.status = Some(match result {
             Ok(bookmark) => {
-                self.view = bookmark.view;
-                self.orbit = None; // force fresh caches
-                self.ifs_cache = None;
+                self.apply_bookmark(bookmark);
                 format!("Restored view from {}", path.display())
             }
             Err(e) => format!("Load failed: {e}"),
         });
+    }
+
+    fn apply_bookmark(&mut self, bookmark: Bookmark) {
+        self.view = bookmark.view;
+        self.orbit = None; // force fresh caches
+        self.ifs_cache = None;
+        self.coord_edit.dirty = false;
+    }
+
+    /// Directory holding journal entries (bookmark-PNG thumbnails), in the
+    /// platform's per-user app-data location.
+    fn journal_dir() -> Result<std::path::PathBuf, String> {
+        use std::path::PathBuf;
+        let base = if cfg!(target_os = "macos") {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Library/Application Support"))
+        } else if cfg!(target_os = "windows") {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+                })
+        };
+        base.map(|b| b.join("FractalX").join("journal"))
+            .ok_or_else(|| "no home directory".to_owned())
+    }
+
+    /// Scan the journal directory into entries, newest first (timestamp
+    /// filenames sort chronologically). Unreadable files are skipped.
+    fn load_journal(ctx: &egui::Context) -> Vec<JournalEntry> {
+        let Ok(dir) = Self::journal_dir() else {
+            return vec![];
+        };
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            return vec![]; // not created yet: empty journal
+        };
+        let mut paths: Vec<_> = read
+            .filter_map(|e| Some(e.ok()?.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "png"))
+            .collect();
+        paths.sort();
+        paths.reverse();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let (w, h, rgba) = export::read_png_rgba(&path).ok()?;
+                let json = export::load_bookmark_json(&path).ok()?;
+                let bookmark: Bookmark = serde_json::from_str(&json).ok()?;
+                let texture = ctx.load_texture(
+                    format!("journal:{}", path.display()),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                );
+                Some(JournalEntry {
+                    path,
+                    family: bookmark.view.rule.display_name(),
+                    texture,
+                })
+            })
+            .collect()
+    }
+
+    /// Render a thumbnail of the current view and save it (with the bookmark
+    /// embedded) as a new journal entry.
+    fn save_journal_entry(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        let result = (|| -> Result<String, String> {
+            // Thumbnail follows the canvas aspect so reopening reproduces
+            // the framing the thumbnail shows.
+            let w = 256u32;
+            let aspect = (self.canvas_size.y / self.canvas_size.x.max(1.0)).clamp(0.25, 2.0);
+            let h = ((w as f32 * aspect) as u32).max(16);
+            let pixels = self.render_pixels(frame, w, h)?;
+
+            let dir = Self::journal_dir()?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis();
+            let path = dir.join(format!("bm-{millis}.png"));
+            export::save_png(&path, w, h, &pixels, &self.bookmark_json()?)?;
+
+            let texture = ctx.load_texture(
+                format!("journal:{}", path.display()),
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels),
+                egui::TextureOptions::LINEAR,
+            );
+            self.journal
+                .get_or_insert_with(Vec::new)
+                .insert(
+                    0,
+                    JournalEntry {
+                        path,
+                        family: self.view.rule.display_name(),
+                        texture,
+                    },
+                );
+            Ok("Saved to journal".to_owned())
+        })();
+        self.status = Some(result.unwrap_or_else(|e| format!("Journal save failed: {e}")));
     }
 
     /// Parse the coordinate editor and jump the view there.
@@ -952,7 +1099,7 @@ impl App {
                                 .range(0.0..=100.0)
                                 .max_decimals(3),
                         );
-                        if ui.small_button("✕").clicked() {
+                        if cross_button(ui).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -1044,7 +1191,7 @@ impl App {
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY),
                         );
-                        if ui.small_button("✕").clicked() {
+                        if cross_button(ui).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -1307,8 +1454,137 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(4.0);
+        ui.strong("Journal");
+        ui.add_space(4.0);
+        // Disabled while the gallery covers the canvas: the button captures
+        // the current fractal view, which isn't on screen in bookmark mode.
+        if ui
+            .add_enabled(
+                !self.journal_mode,
+                egui::Button::new("Save view to journal"),
+            )
+            .clicked()
+        {
+            self.save_journal_entry(frame, ui.ctx());
+        }
+        let label = if self.journal_mode {
+            "Back to fractal"
+        } else {
+            "Bookmarks…"
+        };
+        if ui.button(label).clicked() {
+            self.journal_mode = !self.journal_mode;
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
         ui.small("Drag to pan · scroll or pinch to zoom");
         ui.add_space(12.0);
+    }
+
+    /// Bookmark mode: the journal gallery rendered in the main canvas area —
+    /// a scrollable wrapped grid of clickable thumbnails.
+    fn journal_gallery(&mut self, ui: &mut egui::Ui) {
+        if self.journal.is_none() {
+            self.journal = Some(Self::load_journal(ui.ctx()));
+        }
+
+        let mut open: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Journal");
+                            ui.add_space(8.0);
+                            ui.small("click a view to open it · Esc to go back");
+                        });
+                        ui.add_space(12.0);
+
+                        let entries = self.journal.as_ref().expect("just ensured");
+                        if entries.is_empty() {
+                            ui.label("No saved views yet — use “Save view to journal”.");
+                            return;
+                        }
+                        const THUMB_W: f32 = 200.0;
+                        // Top-aligned wrap: cells must not be vertically
+                        // centered per row, or unequal heights stagger them.
+                        let layout = egui::Layout::left_to_right(egui::Align::Min)
+                            .with_main_wrap(true);
+                        ui.with_layout(layout, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 16.0);
+                            for (i, entry) in entries.iter().enumerate() {
+                                let tex_size = entry.texture.size_vec2();
+                                let size = egui::vec2(
+                                    THUMB_W,
+                                    THUMB_W * tex_size.y / tex_size.x.max(1.0),
+                                );
+                                ui.allocate_ui(egui::vec2(THUMB_W, size.y + 28.0), |ui| {
+                                    ui.spacing_mut().item_spacing.y = 6.0;
+                                    ui.vertical(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Image::new((
+                                                    entry.texture.id(),
+                                                    size,
+                                                ))
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(
+                                                egui::CursorIcon::PointingHand,
+                                            )
+                                            .on_hover_text("Open this view")
+                                            .clicked()
+                                        {
+                                            open = Some(i);
+                                        }
+                                        ui.horizontal(|ui| {
+                                            ui.small(entry.family);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(
+                                                    egui::Align::Center,
+                                                ),
+                                                |ui| {
+                                                    if cross_button(ui)
+                                                        .on_hover_text(
+                                                            "Delete this entry",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        delete = Some(i);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                });
+                            }
+                        });
+                    });
+            });
+
+        if let Some(i) = open {
+            self.journal_mode = false;
+            let path = self.journal.as_ref().expect("checked")[i].path.clone();
+            let result = export::load_bookmark_json(&path).and_then(|json| {
+                serde_json::from_str::<Bookmark>(&json).map_err(|e| e.to_string())
+            });
+            self.status = Some(match result {
+                Ok(bookmark) => {
+                    self.apply_bookmark(bookmark);
+                    "Opened journal view".to_owned()
+                }
+                Err(e) => format!("Journal load failed: {e}"),
+            });
+        }
+        if let Some(i) = delete {
+            let entry = self.journal.as_mut().expect("checked").remove(i);
+            std::fs::remove_file(&entry.path).ok();
+        }
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -2025,9 +2301,28 @@ impl eframe::App for App {
                     .show(ui, |ui| self.controls(ui, frame));
             });
 
+        // Esc leaves bookmark mode.
+        if self.journal_mode
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.journal_mode = false;
+        }
+
+        let canvas_frame = if self.journal_mode {
+            egui::Frame::central_panel(ui.style())
+        } else {
+            egui::Frame::NONE
+        };
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.canvas(ui, frame));
+            .frame(canvas_frame)
+            .show(ui, |ui| {
+                if self.journal_mode {
+                    self.journal_gallery(ui);
+                } else {
+                    self.canvas(ui, frame);
+                }
+            });
     }
 }
 
