@@ -161,6 +161,13 @@ Built so far:
   thread-count invariant, tested). Four presets, numeric a/b/c/d editing
   (edits refit the viewport), progressive accumulation, CPU export with the
   point budget scaled to pixel count. Bookmark family tag: `attractor`.
+- **Hover-linked Julia preview** (§3.1 duality) — while exploring the
+  Mandelbrot set, a corner overlay renders the Julia set for the c under the
+  cursor in real time (small fixed-iteration GPU render, re-run only when c
+  or the palette changes; keeps its last c when the cursor leaves the
+  canvas). Sidebar checkbox to show/hide; `J` pins/unpins the preview's c
+  (accented border + label while pinned); clicking the pane (or its "Julia
+  view" button) promotes the displayed c to the full Julia family view.
 - **Iteration chunking** (§4.1 second layer) — above 2048 iterations, a ladder rung renders via a compute shader that advances every pixel by 2048 iterations per frame, persisting per-pixel state in a storage buffer (`ceil(max_iter/chunk)` dispatches guarantee completion — no readback). No single dispatch can stall the GPU at 100k iterations. Chunk resumption is bit-exact vs. a single dispatch (tested); fragment and compute variants differ by driver-level float jitter on ~1% boundary pixels (tolerated in tests).
 
-Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; Julia companion pane; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.
+Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.

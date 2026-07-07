@@ -22,7 +22,9 @@ zooming in.*
   Multibrot (power 2–8), and Julia sets (pick the constant numerically or
   from classic presets): smooth pan (drag) and zoom (scroll/pinch, anchored
   at the pointer), iteration depth up to 100,000, and exact coordinate entry
-  (paste a 40-digit deep-zoom location and jump straight there).
+  (paste a 40-digit deep-zoom location and jump straight there). While
+  exploring the Mandelbrot set, a corner overlay previews the Julia set for
+  the point under the cursor, live.
 - **Color palettes** — six cosine-gradient presets (Classic, Sunset, Fire,
   Electric, Pastel, Grayscale) with frequency and phase controls, shared by
   the escape-time and IFS renderers. Palette changes re-colorize instantly —
@@ -119,9 +121,8 @@ self-similarity (escape-time fractals, IFS/L-systems, and statistical
 fractals); see [CONCEPT.md](CONCEPT.md) for the full vision and current
 implementation status.
 
-Planned next: visual drag-handle editing of IFS maps, a hover-linked Julia
-companion pane, a bookmarks journal with thumbnails, palette editor,
-custom formula expressions.
+Planned next: visual drag-handle editing of IFS maps, a bookmarks journal
+with thumbnails, palette editor, custom formula expressions.
 
 ## Tech
 

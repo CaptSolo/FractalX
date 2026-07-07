@@ -196,6 +196,31 @@ struct IfsCache {
     texture: egui::TextureHandle,
 }
 
+/// Hover-linked Julia preview: a small corner overlay showing the Julia set
+/// for the c under the cursor (Mandelbrot family only). Re-rendered only
+/// when c, the palette, or the pane size changes — a fixed-iteration render
+/// this small is a sub-millisecond GPU job.
+struct JuliaPane {
+    /// c/palette of the current texture contents (c is NaN until first render).
+    rendered_c: [f32; 2],
+    rendered_palette: (palette::Palette, f32, f32),
+    size_px: u32,
+    data_texture: wgpu::Texture,
+    color_texture: wgpu::Texture,
+    texture_id: egui::TextureId,
+}
+
+/// Julia-pane edge length in screen points.
+const JULIA_PANE_POINTS: f32 = 200.0;
+/// Iteration cap for the preview (fixed: it never deep-zooms).
+const JULIA_PANE_ITERS: u32 = 300;
+
+/// Where the Julia pane sits: bottom-right corner of the canvas.
+fn julia_pane_rect(canvas: egui::Rect) -> egui::Rect {
+    let size = egui::vec2(JULIA_PANE_POINTS, JULIA_PANE_POINTS);
+    egui::Rect::from_min_size(canvas.right_bottom() - size - egui::vec2(12.0, 12.0), size)
+}
+
 /// Progressive strange-attractor render, mirroring `IfsCache`: deterministic
 /// orbits fill the histogram over frames; the tone-map re-runs on palette
 /// changes without re-iterating.
@@ -292,6 +317,10 @@ struct App {
     lsys_cache: Option<LsysCache>,
     attr_cache: Option<AttractorCache>,
     mandel_prog: Option<MandelProgressive>,
+    show_julia_pane: bool,
+    /// Pinned Julia-preview c (J toggles); None = track the cursor.
+    julia_pin: Option<[f64; 2]>,
+    julia_pane: Option<JuliaPane>,
 }
 
 impl App {
@@ -317,6 +346,9 @@ impl App {
             lsys_cache: None,
             attr_cache: None,
             mandel_prog: None,
+            show_julia_pane: true,
+            julia_pin: None,
+            julia_pane: None,
         }
     }
 
@@ -786,7 +818,16 @@ impl App {
         ui.add_space(8.0);
 
         match &mut self.view.rule {
-            FractalRule::Mandelbrot | FractalRule::Tricorn => {
+            FractalRule::Mandelbrot => {
+                ui.label("Max iterations");
+                ui.add(
+                    egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.show_julia_pane, "Julia preview (hover)");
+                ui.small("J pins / unpins the preview point");
+            }
+            FractalRule::Tricorn => {
                 ui.label("Max iterations");
                 ui.add(
                     egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
@@ -1257,6 +1298,178 @@ impl App {
             FractalRule::Attractor { .. } => self.paint_attractor(ui, rect),
             _ => self.paint_mandelbrot(ui, frame, rect, dragging),
         }
+
+        if self.show_julia_pane && matches!(self.view.rule, FractalRule::Mandelbrot) {
+            // c under the cursor; off-canvas (or over the pane itself, so
+            // that mousing toward the pane doesn't drag c along) the pane
+            // keeps its last c.
+            let hover_c = response
+                .hover_pos()
+                .filter(|pos| !julia_pane_rect(rect).contains(*pos))
+                .map(|pos| {
+                    let off = pos - rect.center();
+                    let upp = self.view.units_per_point;
+                    let center = self.view.center.to_f64();
+                    [center[0] + off.x as f64 * upp, center[1] - off.y as f64 * upp]
+                });
+            // J pins the preview to the current c (and unpins again), so a
+            // find can be kept while the cursor moves on. Skipped while a
+            // text field owns the keyboard.
+            if !ui.ctx().egui_wants_keyboard_input()
+                && ui.input(|i| i.key_pressed(egui::Key::J))
+            {
+                self.julia_pin = match self.julia_pin {
+                    Some(_) => None,
+                    None => hover_c.or_else(|| {
+                        // Cursor off-canvas: pin what the pane is showing.
+                        self.julia_pane.as_ref().and_then(|p| {
+                            p.rendered_c[0]
+                                .is_finite()
+                                .then(|| [p.rendered_c[0] as f64, p.rendered_c[1] as f64])
+                        })
+                    }),
+                };
+            }
+            let c = self.julia_pin.or(hover_c);
+            self.paint_julia_pane(ui, frame, rect, c);
+        }
+    }
+
+    /// Render (when needed) and draw the hover-linked Julia preview in the
+    /// bottom-right corner of the canvas.
+    fn paint_julia_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        rect: egui::Rect,
+        hover_c: Option<[f64; 2]>,
+    ) {
+        let Some(render_state) = frame.wgpu_render_state.as_ref() else {
+            return;
+        };
+        let c = match (hover_c, &self.julia_pane) {
+            (Some(c), _) => [c[0] as f32, c[1] as f32],
+            (None, Some(pane)) if pane.rendered_c[0].is_finite() => pane.rendered_c,
+            _ => return, // nothing hovered yet: no pane to show
+        };
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
+        let palette_uniforms = self.palette_uniforms();
+        let ppp = ui.ctx().pixels_per_point();
+        let size_px = ((JULIA_PANE_POINTS * ppp) as u32).clamp(64, 1024);
+
+        let device = &render_state.device;
+        let queue = &render_state.queue;
+        let mut renderer = render_state.renderer.write();
+
+        if self.julia_pane.as_ref().is_none_or(|p| p.size_px != size_px) {
+            let (data_texture, color_texture) = RenderResources::create_targets(
+                device,
+                size_px,
+                size_px,
+                wgpu::TextureUsages::empty(),
+            );
+            let color_view = color_texture.create_view(&Default::default());
+            let texture_id =
+                renderer.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
+            if let Some(old) = self.julia_pane.take() {
+                renderer.free_texture(&old.texture_id);
+            }
+            self.julia_pane = Some(JuliaPane {
+                rendered_c: [f32::NAN; 2], // forces the first render
+                rendered_palette: palette,
+                size_px,
+                data_texture,
+                color_texture,
+                texture_id,
+            });
+        }
+
+        let pane = self.julia_pane.as_mut().expect("just ensured");
+        if pane.rendered_c != c || pane.rendered_palette != palette {
+            if let Some(resources) = renderer.callback_resources.get::<RenderResources>() {
+                let uniforms = Uniforms {
+                    center: [0.0, 0.0],
+                    half_extent: [1.7, 1.7],
+                    dc_offset: [0.0, 0.0],
+                    julia_c: c,
+                    max_iter: JULIA_PANE_ITERS,
+                    ref_len: 0,
+                    use_perturb: 0,
+                    formula: mandelbrot::FORMULA_JULIA,
+                    power: 2,
+                    _pad: 0,
+                };
+                let data_view = pane.data_texture.create_view(&Default::default());
+                let color_view = pane.color_texture.create_view(&Default::default());
+                resources.render_data(device, queue, &uniforms, &data_view);
+                resources.colorize(device, queue, &data_view, &palette_uniforms, &color_view);
+                pane.rendered_c = c;
+                pane.rendered_palette = palette;
+            }
+        }
+        drop(renderer);
+
+        let pane = self.julia_pane.as_ref().expect("just ensured");
+        let pane_rect = julia_pane_rect(rect);
+        ui.painter().image(
+            pane.texture_id,
+            pane_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        let stroke = if self.julia_pin.is_some() {
+            ui.visuals().selection.stroke
+        } else {
+            ui.visuals().window_stroke()
+        };
+        ui.painter()
+            .rect_stroke(pane_rect, 2.0, stroke, egui::StrokeKind::Outside);
+        if self.julia_pin.is_some() {
+            ui.painter().text(
+                pane_rect.right_top() - egui::vec2(2.0, 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "pinned · J",
+                egui::FontId::proportional(11.0),
+                stroke.color,
+            );
+        }
+
+        // Click the pane (or its corner button) to open this c as a full
+        // Julia view. The displayed c is the one that jumps.
+        let displayed_c = [pane.rendered_c[0] as f64, pane.rendered_c[1] as f64];
+        let pane_response = ui
+            .interact(
+                pane_rect,
+                ui.id().with("julia-pane"),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Open as Julia view");
+        let button_rect = egui::Rect::from_min_size(
+            pane_rect.left_top() + egui::vec2(4.0, 4.0),
+            egui::vec2(80.0, 18.0),
+        );
+        let button_clicked = ui
+            .put(button_rect, egui::Button::new("Julia view").small())
+            .clicked();
+        if (pane_response.clicked() || button_clicked) && displayed_c[0].is_finite() {
+            self.open_julia_view(displayed_c);
+        }
+    }
+
+    /// Promote the previewed c to the full Julia family at its home view.
+    fn open_julia_view(&mut self, c: [f64; 2]) {
+        self.view.rule = FractalRule::Julia { c };
+        let (center, upp) = self.view.rule.home_view();
+        self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
+        self.view.units_per_point = upp;
+        self.orbit = None;
+        self.julia_pin = None;
+        self.coord_edit.dirty = false;
     }
 
     /// Progressive Mandelbrot: render into a texture via a resolution ladder.

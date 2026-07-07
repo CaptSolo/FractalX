@@ -76,7 +76,8 @@ built vs. pending; keep it updated when a milestone lands.
 - **eframe 0.35 diverges from older egui examples** (and from training data):
   `App::ui(&mut self, ui, frame)` not `App::update`, `egui::Panel::left` not
   `SidePanel`, wgpu 29 renames (`multiview_mask`, `immediate_size`,
-  `bind_group_layouts: &[Some(..)]`, `PollType::wait_indefinitely()`). When
+  `bind_group_layouts: &[Some(..)]`, `PollType::wait_indefinitely()`,
+  `Context::egui_wants_keyboard_input` not `wants_keyboard_input`). When
   unsure, read the vendored sources in `~/.cargo/registry/src/`.
 - **Cross-pipeline float jitter is normal**: Metal schedules float ops
   differently in fragment vs compute variants of the same WGSL, so ~1% of
