@@ -144,9 +144,11 @@ Built so far:
   palette. Nine presets: Koch snowflake/island, dragon, Hilbert, Gosper, and
   Lévy C curves, Sierpinski arrowhead, plant, and bush.
   Full rule editing in the UI (axiom, per-symbol rules, angle,
-  generations); *Reset view* fits the drawing's bounds. Segments cache until
-  the rule changes; pan/zoom/palette only re-rasterize. Bookmark family tag:
-  `l_system`.
+  generations); any rule edit (and *Reset view*) refits the viewport to the
+  drawing's bounds, and the zoom-out limit scales with the drawing. A notice
+  shows when the symbol cap cuts expansion short of the requested
+  generations. Segments cache until the rule changes; pan/zoom/palette only
+  re-rasterize. Bookmark family tag: `l_system`.
 - **Iteration chunking** (§4.1 second layer) — above 2048 iterations, a ladder rung renders via a compute shader that advances every pixel by 2048 iterations per frame, persisting per-pixel state in a storage buffer (`ceil(max_iter/chunk)` dispatches guarantee completion — no readback). No single dispatch can stall the GPU at 100k iterations. Chunk resumption is bit-exact vs. a single dispatch (tested); fragment and compute variants differ by driver-level float jitter on ~1% boundary pixels (tolerated in tests).
 
 Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; Julia companion pane; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.
