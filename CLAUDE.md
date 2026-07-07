@@ -27,6 +27,11 @@ built vs. pending; keep it updated when a milestone lands.
   perturbation reference orbit. Precision auto-scales: zoom bits + 64 guard bits.
 - `src/ifs.rs` — IFS chaos game: 16 fixed-seed walkers over rayon, atomic
   scatter-adds into a shared histogram; log tone-map through the shared palette.
+- `src/lsystem.rs` — L-systems: rewrite expansion (capped at `MAX_SYMBOLS` —
+  returns the last complete generation, never a truncated string), turtle
+  interpretation (`F G f g + - [ ]`), CPU rasterization (Liang–Barsky clip +
+  DDA) colored by arc position through the shared palette. Fully
+  deterministic (no RNG). Bookmark family tag: `l_system`.
 - `src/palette.rs` — named cosine-gradient presets (`a + b·cos(2π(c·x + d))`);
   one coefficient table drives both the WGSL color pass and the CPU IFS
   tone-map. `Classic` must stay bit-identical to the original palette
@@ -74,6 +79,10 @@ built vs. pending; keep it updated when a milestone lands.
   — don't tighten them to exact equality across pipelines. Chunk *resumption*
   (multi-dispatch vs single dispatch, same pipeline) IS bit-exact and tested
   as such.
+- **Panels grow to content unless pinned**: `egui::Panel` `default_size` +
+  `resizable(false)` still lets content widen the panel — a focused
+  `desired_width(f32::INFINITY)` TextEdit expands it over the canvas. The
+  controls panel uses `exact_size` for this reason; keep it.
 - **naga return analysis**: a WGSL function whose body ends in an
   always-returning `loop` still needs a trailing unreachable `return`.
 - **dashu base conversion is ~1 ulp inexact**: bookmark decimal round trips are

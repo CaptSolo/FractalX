@@ -4,6 +4,7 @@
 mod deep;
 mod export;
 mod ifs;
+mod lsystem;
 mod mandelbrot;
 mod palette;
 
@@ -39,11 +40,20 @@ enum FractalRule {
         maps: Vec<ifs::AffineMap>,
         points: u64,
     },
+    LSystem {
+        axiom: String,
+        rules: Vec<lsystem::Rule>,
+        angle_deg: f64,
+        generations: u32,
+    },
 }
 
 impl FractalRule {
     fn is_escape_time(&self) -> bool {
-        !matches!(self, FractalRule::Ifs { .. })
+        !matches!(
+            self,
+            FractalRule::Ifs { .. } | FractalRule::LSystem { .. }
+        )
     }
 
     fn display_name(&self) -> &'static str {
@@ -52,6 +62,7 @@ impl FractalRule {
             FractalRule::Tricorn => "Tricorn",
             FractalRule::Multibrot { .. } => "Multibrot",
             FractalRule::Ifs { .. } => "IFS (chaos game)",
+            FractalRule::LSystem { .. } => "L-system",
         }
     }
 
@@ -62,6 +73,8 @@ impl FractalRule {
             FractalRule::Tricorn => ([-0.25, 0.0], 0.005),
             FractalRule::Multibrot { .. } => ([0.0, 0.0], 0.004),
             FractalRule::Ifs { .. } => ([0.5, 0.43], 0.0016),
+            // Placeholder; L-system views are fitted to the drawing's bounds.
+            FractalRule::LSystem { .. } => ([0.0, 0.0], 0.01),
         }
     }
 }
@@ -165,6 +178,25 @@ struct IfsCache {
     texture: egui::TextureHandle,
 }
 
+/// Cached L-system render: turtle segments (recomputed only when the rule
+/// changes) plus the last rasterized image (recomputed when the view, size,
+/// or palette changes — rasterizing is cheap next to expansion).
+struct LsysCache {
+    // Segment key
+    axiom: String,
+    rules: Vec<lsystem::Rule>,
+    angle_deg: f64,
+    generations: u32,
+    // Image key (`size == [0, 0]` marks "never rasterized")
+    center: [f64; 2],
+    units_per_pixel: f64,
+    size: [usize; 2],
+    palette: (palette::Palette, f32, f32),
+
+    segments: Vec<lsystem::Segment>,
+    texture: egui::TextureHandle,
+}
+
 /// Progressive Mandelbrot render: a resolution ladder. While the view
 /// changes, only the coarsest level is rendered (cheap); once it settles,
 /// each frame re-renders one level finer until full resolution. The data
@@ -215,6 +247,7 @@ struct App {
     status: Option<String>,
     orbit: Option<OrbitCache>,
     ifs_cache: Option<IfsCache>,
+    lsys_cache: Option<LsysCache>,
     mandel_prog: Option<MandelProgressive>,
 }
 
@@ -238,6 +271,7 @@ impl App {
             status: None,
             orbit: None,
             ifs_cache: None,
+            lsys_cache: None,
             mandel_prog: None,
         }
     }
@@ -253,6 +287,29 @@ impl App {
             return;
         };
         if let Some([min_x, min_y, max_x, max_y]) = ifs::attractor_bbox(maps, 20_000) {
+            let w = (max_x - min_x).max(1e-6);
+            let h = (max_y - min_y).max(1e-6);
+            self.view.center =
+                deep::BigComplex::from_f64((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+            let upp_w = w / self.canvas_size.x.max(1.0) as f64;
+            let upp_h = h / self.canvas_size.y.max(1.0) as f64;
+            self.view.units_per_point = upp_w.max(upp_h) * 1.1;
+        }
+    }
+
+    /// Fit the viewport to the L-system drawing's bounding box.
+    fn fit_lsystem_view(&mut self) {
+        let FractalRule::LSystem {
+            axiom,
+            rules,
+            angle_deg,
+            generations,
+        } = &self.view.rule
+        else {
+            return;
+        };
+        let segs = lsystem::segments(axiom, rules, *angle_deg, *generations);
+        if let Some([min_x, min_y, max_x, max_y]) = lsystem::bounds(&segs) {
             let w = (max_x - min_x).max(1e-6);
             let h = (max_y - min_y).max(1e-6);
             self.view.center =
@@ -412,6 +469,29 @@ impl App {
                         self.view.palette_phase,
                     )
                 }
+                FractalRule::LSystem {
+                    axiom,
+                    rules,
+                    angle_deg,
+                    generations,
+                } => {
+                    // Same vertical framing as the canvas.
+                    let world_h = self.view.units_per_point * self.canvas_size.y as f64;
+                    let view = lsystem::View {
+                        center: self.view.center.to_f64(),
+                        units_per_pixel: world_h / h as f64,
+                    };
+                    let segs = lsystem::segments(axiom, rules, *angle_deg, *generations);
+                    lsystem::rasterize_rgba(
+                        &segs,
+                        view,
+                        w as usize,
+                        h as usize,
+                        self.view.palette,
+                        self.view.palette_freq,
+                        self.view.palette_phase,
+                    )
+                }
             };
 
             let bookmark = Bookmark {
@@ -496,19 +576,36 @@ impl App {
         self.view.units_per_point = preset.units_per_point;
     }
 
+    /// Switch to the given L-system preset and fit the viewport to it.
+    fn apply_lsystem_preset(&mut self, preset: &lsystem::Preset) {
+        self.view.rule = FractalRule::LSystem {
+            axiom: preset.axiom.into(),
+            rules: preset.rules_vec(),
+            angle_deg: preset.angle_deg,
+            generations: preset.generations,
+        };
+        self.fit_lsystem_view();
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         ui.heading("FractalX");
         ui.add_space(8.0);
 
         // Family selection: a discriminant-only copy drives the combo box.
         let mut selected = std::mem::discriminant(&self.view.rule);
-        let choices: [FractalRule; 4] = [
+        let choices: [FractalRule; 5] = [
             FractalRule::Mandelbrot,
             FractalRule::Tricorn,
             FractalRule::Multibrot { power: 3 },
             FractalRule::Ifs {
                 maps: vec![],
                 points: 0,
+            },
+            FractalRule::LSystem {
+                axiom: String::new(),
+                rules: vec![],
+                angle_deg: 0.0,
+                generations: 0,
             },
         ];
         egui::ComboBox::from_label("Family")
@@ -529,12 +626,15 @@ impl App {
                 .expect("selected comes from choices");
             if matches!(chosen, FractalRule::Ifs { .. }) {
                 self.apply_preset(&ifs::PRESETS[0]);
+            } else if matches!(chosen, FractalRule::LSystem { .. }) {
+                self.apply_lsystem_preset(&lsystem::PRESETS[0]);
             } else {
                 let (center, upp) = chosen.home_view();
                 self.view.rule = chosen;
                 self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
                 self.view.units_per_point = upp;
                 self.ifs_cache = None;
+                self.lsys_cache = None;
             }
             self.orbit = None;
             self.coord_edit.dirty = false;
@@ -628,6 +728,82 @@ impl App {
                     self.apply_preset(preset);
                 }
             }
+            FractalRule::LSystem {
+                axiom,
+                rules,
+                angle_deg,
+                generations,
+            } => {
+                ui.label("Generations");
+                ui.add(egui::Slider::new(generations, 0..=16));
+                ui.horizontal(|ui| {
+                    ui.label("Angle");
+                    ui.add(
+                        egui::DragValue::new(angle_deg)
+                            .speed(0.5)
+                            .range(0.0..=180.0)
+                            .suffix("°"),
+                    );
+                });
+                ui.add_space(8.0);
+
+                ui.label("Presets");
+                let mut chosen: Option<&lsystem::Preset> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for preset in lsystem::PRESETS {
+                        if ui.small_button(preset.name).clicked() {
+                            chosen = Some(preset);
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label("Axiom");
+                ui.add(
+                    egui::TextEdit::singleline(axiom).font(egui::TextStyle::Monospace),
+                );
+                ui.label("Rules");
+                let mut remove: Option<usize> = None;
+                for (i, r) in rules.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut sym = r.symbol.to_string();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut sym)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(16.0),
+                        );
+                        if resp.changed() {
+                            if let Some(c) = sym.chars().last() {
+                                r.symbol = c;
+                            }
+                        }
+                        ui.label("→");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut r.replacement)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    rules.remove(i);
+                }
+                if ui.small_button("+ Add rule").clicked() {
+                    rules.push(lsystem::Rule {
+                        symbol: 'F',
+                        replacement: "F".into(),
+                    });
+                }
+                ui.add_space(4.0);
+                ui.small("F G draw · f g move · + - turn · [ ] branch");
+
+                if let Some(preset) = chosen {
+                    self.apply_lsystem_preset(preset);
+                }
+            }
         }
         ui.add_space(8.0);
 
@@ -646,12 +822,14 @@ impl App {
         ui.add_space(12.0);
 
         if ui.button("Reset view").clicked() {
-            if self.view.rule.is_escape_time() {
-                let (center, upp) = self.view.rule.home_view();
-                self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
-                self.view.units_per_point = upp;
-            } else {
-                self.fit_ifs_view();
+            match &self.view.rule {
+                FractalRule::Ifs { .. } => self.fit_ifs_view(),
+                FractalRule::LSystem { .. } => self.fit_lsystem_view(),
+                _ => {
+                    let (center, upp) = self.view.rule.home_view();
+                    self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
+                    self.view.units_per_point = upp;
+                }
             }
             self.orbit = None;
         }
@@ -818,10 +996,10 @@ impl App {
 
         self.canvas_size = rect.size();
         let dragging = response.dragged();
-        if self.view.rule.is_escape_time() {
-            self.paint_mandelbrot(ui, frame, rect, dragging);
-        } else {
-            self.paint_ifs(ui, rect);
+        match &self.view.rule {
+            FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
+            FractalRule::LSystem { .. } => self.paint_lsystem(ui, rect),
+            _ => self.paint_mandelbrot(ui, frame, rect, dragging),
         }
     }
 
@@ -1099,6 +1277,94 @@ impl App {
             ui.ctx().request_repaint();
         }
     }
+
+    /// Cached L-system render: segments rebuild only when the rule changes;
+    /// the image re-rasterizes when the view, size, or palette changes.
+    fn paint_lsystem(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let FractalRule::LSystem {
+            axiom,
+            rules,
+            angle_deg,
+            generations,
+        } = &self.view.rule
+        else {
+            return;
+        };
+        let (axiom, rules, angle_deg, generations) =
+            (axiom.clone(), rules.clone(), *angle_deg, *generations);
+
+        let ppp = ui.ctx().pixels_per_point() as f64;
+        let w = ((rect.width() as f64 * ppp) as usize).clamp(16, 4096);
+        let h = ((rect.height() as f64 * ppp) as usize).clamp(16, 4096);
+        let center = self.view.center.to_f64();
+        let units_per_pixel = self.view.units_per_point / ppp;
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
+
+        let segs_valid = self.lsys_cache.as_ref().is_some_and(|c| {
+            c.axiom == axiom
+                && c.rules == rules
+                && c.angle_deg == angle_deg
+                && c.generations == generations
+        });
+        if !segs_valid {
+            let segments = lsystem::segments(&axiom, &rules, angle_deg, generations);
+            let image = egui::ColorImage::filled([w, h], egui::Color32::BLACK);
+            let texture =
+                ui.ctx()
+                    .load_texture("lsystem-render", image, egui::TextureOptions::LINEAR);
+            self.lsys_cache = Some(LsysCache {
+                axiom,
+                rules,
+                angle_deg,
+                generations,
+                center,
+                units_per_pixel,
+                size: [0, 0], // forces the first rasterize below
+                palette,
+                segments,
+                texture,
+            });
+        }
+
+        let cache = self.lsys_cache.as_mut().expect("just ensured");
+        if cache.center != center
+            || cache.units_per_pixel != units_per_pixel
+            || cache.size != [w, h]
+            || cache.palette != palette
+        {
+            let rgba = lsystem::rasterize_rgba(
+                &cache.segments,
+                lsystem::View {
+                    center,
+                    units_per_pixel,
+                },
+                w,
+                h,
+                palette.0,
+                palette.1,
+                palette.2,
+            );
+            cache.texture.set(
+                egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                egui::TextureOptions::LINEAR,
+            );
+            cache.center = center;
+            cache.units_per_pixel = units_per_pixel;
+            cache.size = [w, h];
+            cache.palette = palette;
+        }
+
+        ui.painter().image(
+            cache.texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 impl eframe::App for App {
@@ -1106,9 +1372,11 @@ impl eframe::App for App {
         let frame: &eframe::Frame = frame;
         self.maintain_orbit(frame);
 
+        // Exact width: content (e.g. focused full-width text fields) must
+        // never widen the panel over the canvas.
         egui::Panel::left("controls")
             .resizable(false)
-            .default_size(220.0)
+            .exact_size(260.0)
             .show(ui, |ui| self.controls(ui, frame));
 
         egui::CentralPanel::default()
@@ -1154,6 +1422,42 @@ mod tests {
             FractalRule::Ifs { maps, points } => {
                 assert_eq!(points, 2_000_000);
                 assert_eq!(maps, ifs::PRESETS[1].maps.to_vec());
+            }
+            _ => panic!("rule family lost in round trip"),
+        }
+    }
+
+    #[test]
+    fn lsystem_bookmark_round_trips() {
+        let preset = &lsystem::PRESETS[0];
+        let view = ViewState {
+            rule: FractalRule::LSystem {
+                axiom: preset.axiom.into(),
+                rules: preset.rules_vec(),
+                angle_deg: preset.angle_deg,
+                generations: preset.generations,
+            },
+            ..ViewState::default()
+        };
+        let json = serde_json::to_string(&Bookmark {
+            app: "fractalx".into(),
+            version: 3,
+            view,
+        })
+        .unwrap();
+        assert!(json.contains(r#""family":"l_system""#), "{json}");
+        let back: Bookmark = serde_json::from_str(&json).unwrap();
+        match back.view.rule {
+            FractalRule::LSystem {
+                axiom,
+                rules,
+                angle_deg,
+                generations,
+            } => {
+                assert_eq!(axiom, preset.axiom);
+                assert_eq!(rules, preset.rules_vec());
+                assert_eq!(angle_deg, preset.angle_deg);
+                assert_eq!(generations, preset.generations);
             }
             _ => panic!("rule family lost in round trip"),
         }

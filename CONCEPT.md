@@ -137,6 +137,15 @@ Built so far:
 - **Parallel chaos game** — 16 fixed-seed walkers spread over cores via rayon, scatter-adding into a shared histogram with atomics. Deterministic by construction (fixed lane count, cumulative work splitting): identical output for any batch split on any thread count, verified by tests. ~2–3× faster (scatter/atomic-contention bound).
 - **More escape-time formulas** — Tricorn (Mandelbar, z̄²+c) and Multibrot (power 2–8) as variants of one shader iteration core. Deep zoom (perturbation) remains Mandelbrot-only — the z² algebra doesn't carry over — with a UI warning past f32 precision. Bookmark family tags: `tricorn`, `multibrot`.
 - **Palette presets** — named cosine-gradient palettes (Classic, Sunset, Fire, Electric, Pastel, Grayscale) selectable in the UI, shared by the escape-time color pass and the IFS tone-map; the frequency/phase sliders modulate any preset. One coefficient formula (`a + b·cos(2π(c·x + d))`) drives both the shader and the CPU mirror; `Classic` reproduces the original palette exactly (tested). The preset travels in bookmarks (`#[serde(default)]` — older bookmarks load as Classic); switching presets only re-runs the cheap color pass / tone-map.
+- **L-systems** (§3.2) — third fractal family: axiom + rewrite rules expanded
+  (capped at 4M symbols so runaway growth can't hang the UI) and interpreted
+  as turtle graphics (`F G f g + - [ ]`); segments rasterized on the CPU
+  (Liang–Barsky clip + DDA), colored by arc position through the shared
+  palette. Presets: Koch snowflake, dragon curve, Sierpinski arrowhead,
+  fractal plant. Full rule editing in the UI (axiom, per-symbol rules, angle,
+  generations); *Reset view* fits the drawing's bounds. Segments cache until
+  the rule changes; pan/zoom/palette only re-rasterize. Bookmark family tag:
+  `l_system`.
 - **Iteration chunking** (§4.1 second layer) — above 2048 iterations, a ladder rung renders via a compute shader that advances every pixel by 2048 iterations per frame, persisting per-pixel state in a storage buffer (`ceil(max_iter/chunk)` dispatches guarantee completion — no readback). No single dispatch can stall the GPU at 100k iterations. Chunk resumption is bit-exact vs. a single dispatch (tested); fragment and compute variants differ by driver-level float jitter on ~1% boundary pixels (tolerated in tests).
 
-Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; L-systems; Julia companion pane; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.
+Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; Julia companion pane; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.

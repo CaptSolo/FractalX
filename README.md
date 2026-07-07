@@ -37,6 +37,10 @@ zooming in.*
   fern, and Heighway dragon presets; edit the affine maps live (or add your
   own) and watch the attractor respond. *Reset view* fits the viewport to the
   attractor.
+- **L-systems** — a third family: axiom + rewrite rules interpreted as turtle
+  graphics. Koch snowflake, dragon curve, Sierpinski arrowhead, and fractal
+  plant presets, plus a full rule editor (axiom, per-symbol rules, turn angle,
+  generations) — curves are colored along their length through the palette.
 - **Progressive rendering** — interaction never stalls: the Mandelbrot view
   renders through a resolution ladder (coarse immediately, sharpening in
   place), and IFS images "develop" as the chaos game accumulates points each
@@ -70,13 +74,14 @@ cargo test
 
 | Action | Input |
 |---|---|
-| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / IFS) |
+| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / IFS / L-system) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |
 | Iterations / points | sliders in the left panel |
 | Change colors | *Palette* dropdown + frequency/phase sliders |
 | Edit an IFS | preset buttons, then tweak the affine-map coefficients |
+| Edit an L-system | preset buttons, then edit axiom/rules/angle/generations |
 | Export image | set resolution, *Export PNG…* |
 | Reopen an exported view | *Open PNG bookmark…* |
 | Back to the full set / fit attractor | *Reset view* |
@@ -110,7 +115,7 @@ fractals); see [CONCEPT.md](CONCEPT.md) for the full vision and current
 implementation status.
 
 Planned next: visual drag-handle editing of IFS maps, a hover-linked Julia
-companion pane, a bookmarks journal with thumbnails, palette editor, L-systems,
+companion pane, a bookmarks journal with thumbnails, palette editor,
 custom formula expressions.
 
 ## Tech
