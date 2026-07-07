@@ -10,9 +10,12 @@
 
 use crate::palette::Palette;
 
-/// Expansion stops before the symbol string outgrows this (keeps the UI
-/// responsive if the user cranks generations on a fast-growing system).
-pub const MAX_SYMBOLS: usize = 4_000_000;
+/// Expansion stops before the symbol string outgrows this many bytes (keeps
+/// the UI responsive if the user cranks generations on a fast-growing
+/// system). Memory scales at ~32 bytes per drawn symbol (one `Segment`), so
+/// this cap bounds a render at roughly 500 MB transient; pan re-rasterizes
+/// every frame, so much beyond this segment count would also drop frames.
+pub const MAX_SYMBOLS: usize = 16_000_000;
 
 /// One rewrite rule: every occurrence of `symbol` becomes `replacement`.
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
@@ -39,23 +42,27 @@ pub struct View {
 
 /// Rewrite `axiom` for `generations` rounds. If a round would exceed `cap`
 /// symbols, the previous (complete) generation is returned instead — never a
-/// partially rewritten string, so output stays deterministic.
-pub fn expand(axiom: &str, rules: &[Rule], generations: u32, cap: usize) -> String {
+/// partially rewritten string, so output stays deterministic. Returns the
+/// symbols and the number of rounds actually applied (lets the UI warn when
+/// the cap cuts the expansion short).
+pub fn expand(axiom: &str, rules: &[Rule], generations: u32, cap: usize) -> (String, u32) {
     let mut s: String = axiom.into();
-    for _ in 0..generations {
+    for done in 0..generations {
         let mut next = String::with_capacity(s.len() * 2);
         for ch in s.chars() {
             match rules.iter().find(|r| r.symbol == ch) {
                 Some(r) => next.push_str(&r.replacement),
                 None => next.push(ch),
             }
-            if next.chars().count() > cap {
-                return s;
+            // Byte length: O(1), and equal to the symbol count for the
+            // ASCII alphabets L-systems use.
+            if next.len() > cap {
+                return (s, done);
             }
         }
         s = next;
     }
-    s
+    (s, generations)
 }
 
 /// Interpret an expanded string as turtle commands (unit step, starting at
@@ -95,9 +102,16 @@ pub fn turtle_segments(symbols: &str, angle_deg: f64) -> Vec<Segment> {
     segs
 }
 
-/// Expand and interpret in one step.
-pub fn segments(axiom: &str, rules: &[Rule], angle_deg: f64, generations: u32) -> Vec<Segment> {
-    turtle_segments(&expand(axiom, rules, generations, MAX_SYMBOLS), angle_deg)
+/// Expand and interpret in one step; also returns the generations actually
+/// applied (less than requested when `MAX_SYMBOLS` cuts expansion short).
+pub fn segments(
+    axiom: &str,
+    rules: &[Rule],
+    angle_deg: f64,
+    generations: u32,
+) -> (Vec<Segment>, u32) {
+    let (symbols, done) = expand(axiom, rules, generations, MAX_SYMBOLS);
+    (turtle_segments(&symbols, angle_deg), done)
 }
 
 /// Bounding box `[min_x, min_y, max_x, max_y]` over all segment endpoints.
@@ -260,6 +274,41 @@ pub const PRESETS: &[Preset] = &[
         angle_deg: 25.0,
         generations: 6,
     },
+    Preset {
+        name: "Hilbert curve",
+        axiom: "A",
+        rules: &[('A', "-BF+AFA+FB-"), ('B', "+AF-BFB-FA+")],
+        angle_deg: 90.0,
+        generations: 6,
+    },
+    Preset {
+        name: "Gosper curve",
+        axiom: "F",
+        rules: &[('F', "F+G++G-F--FF-G+"), ('G', "-F+GG++G+F--F-G")],
+        angle_deg: 60.0,
+        generations: 4,
+    },
+    Preset {
+        name: "Lévy C curve",
+        axiom: "F",
+        rules: &[('F', "+F--F+")],
+        angle_deg: 45.0,
+        generations: 12,
+    },
+    Preset {
+        name: "Koch island",
+        axiom: "F-F-F-F",
+        rules: &[('F', "F-F+F+FF-F-F+F")],
+        angle_deg: 90.0,
+        generations: 3,
+    },
+    Preset {
+        name: "Bush",
+        axiom: "F",
+        rules: &[('F', "FF-[-F+F+F]+[+F-F-F]")],
+        angle_deg: 22.5,
+        generations: 4,
+    },
 ];
 
 #[cfg(test)]
@@ -276,20 +325,39 @@ mod tests {
     #[test]
     fn expansion_rewrites_and_passes_through() {
         let rules = [rule('F', "F+F--F+F")];
-        assert_eq!(expand("F--F", &rules, 1, MAX_SYMBOLS), "F+F--F+F--F+F--F+F");
+        assert_eq!(
+            expand("F--F", &rules, 1, MAX_SYMBOLS),
+            ("F+F--F+F--F+F--F+F".into(), 1)
+        );
         // Symbols without a rule survive unchanged.
-        assert_eq!(expand("X-Y", &[], 3, MAX_SYMBOLS), "X-Y");
+        assert_eq!(expand("X-Y", &[], 3, MAX_SYMBOLS), ("X-Y".into(), 3));
     }
 
     #[test]
     fn expansion_respects_symbol_cap() {
         // Doubles every generation; a tight cap must return a complete
-        // earlier generation, not a truncated string.
+        // earlier generation, not a truncated string, and report how many
+        // generations actually ran.
         let rules = [rule('F', "FF")];
-        let s = expand("F", &rules, 30, 1000);
+        let (s, done) = expand("F", &rules, 30, 1000);
         assert!(s.len() <= 1000);
         assert!(s.len().is_power_of_two());
         assert!(s.chars().all(|c| c == 'F'));
+        // 2^done symbols: the cap of 1000 stops after generation 9 (512).
+        assert_eq!(done, 9);
+        assert_eq!(s.len(), 1 << done);
+    }
+
+    #[test]
+    fn capped_expansion_of_fast_growing_system_completes_quickly() {
+        // Regression: the cap check must be O(1) per symbol — a rescan of
+        // the output string per appended symbol made expansion quadratic,
+        // hanging the UI at high generation counts.
+        for p in PRESETS {
+            let (s, done) = expand(p.axiom, &p.rules_vec(), 16, MAX_SYMBOLS);
+            assert!(s.len() <= MAX_SYMBOLS);
+            assert!(done <= 16);
+        }
     }
 
     #[test]
@@ -313,7 +381,7 @@ mod tests {
 
     #[test]
     fn rasterize_draws_colored_pixels_on_black() {
-        let segs = segments("F+F+F+F", &[], 90.0, 0);
+        let (segs, _) = segments("F+F+F+F", &[], 90.0, 0);
         let b = bounds(&segs).unwrap();
         let view = View {
             center: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5],
@@ -356,7 +424,8 @@ mod tests {
     #[test]
     fn presets_produce_nonempty_bounded_geometry() {
         for p in PRESETS {
-            let segs = segments(p.axiom, &p.rules_vec(), p.angle_deg, p.generations);
+            let (segs, done) = segments(p.axiom, &p.rules_vec(), p.angle_deg, p.generations);
+            assert_eq!(done, p.generations, "{} preset hits the cap", p.name);
             assert!(!segs.is_empty(), "{} drew nothing", p.name);
             let b = bounds(&segs).unwrap();
             assert!(b.iter().all(|v| v.is_finite()), "{} unbounded", p.name);

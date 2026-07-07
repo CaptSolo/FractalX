@@ -194,6 +194,11 @@ struct LsysCache {
     palette: (palette::Palette, f32, f32),
 
     segments: Vec<lsystem::Segment>,
+    /// Generations actually expanded — less than requested when the
+    /// `MAX_SYMBOLS` cap cut expansion short (the UI warns).
+    generations_done: u32,
+    /// World bbox of `segments`, cached for the zoom-out limit.
+    world_bounds: Option<[f64; 4]>,
     texture: egui::TextureHandle,
 }
 
@@ -276,6 +281,24 @@ impl App {
         }
     }
 
+    /// Interactive zoom-out limit. Escape-time sets and IFS attractors live
+    /// at unit scale; L-system drawings (unit turtle steps) can span
+    /// thousands of world units, so their limit scales with the drawing:
+    /// zoomed all the way out it still covers ~100 screen points.
+    fn max_units_per_point(&self) -> f64 {
+        match &self.view.rule {
+            FractalRule::LSystem { .. } => self
+                .lsys_cache
+                .as_ref()
+                .and_then(|c| c.world_bounds)
+                .map(|[min_x, min_y, max_x, max_y]| {
+                    ((max_x - min_x).max(max_y - min_y) / 100.0).max(0.1)
+                })
+                .unwrap_or(0.1),
+            _ => 0.1,
+        }
+    }
+
     fn perturbation_active(&self) -> bool {
         matches!(self.view.rule, FractalRule::Mandelbrot)
             && self.view.units_per_point < PERTURB_THRESHOLD
@@ -308,7 +331,7 @@ impl App {
         else {
             return;
         };
-        let segs = lsystem::segments(axiom, rules, *angle_deg, *generations);
+        let (segs, _) = lsystem::segments(axiom, rules, *angle_deg, *generations);
         if let Some([min_x, min_y, max_x, max_y]) = lsystem::bounds(&segs) {
             let w = (max_x - min_x).max(1e-6);
             let h = (max_y - min_y).max(1e-6);
@@ -481,7 +504,7 @@ impl App {
                         center: self.view.center.to_f64(),
                         units_per_pixel: world_h / h as f64,
                     };
-                    let segs = lsystem::segments(axiom, rules, *angle_deg, *generations);
+                    let (segs, _) = lsystem::segments(axiom, rules, *angle_deg, *generations);
                     lsystem::rasterize_rgba(
                         &segs,
                         view,
@@ -734,8 +757,11 @@ impl App {
                 angle_deg,
                 generations,
             } => {
+                // Snapshot to detect edits: the drawing's world-space size
+                // changes with the rule, so any edit refits the viewport.
+                let before = (axiom.clone(), rules.clone(), *angle_deg, *generations);
                 ui.label("Generations");
-                ui.add(egui::Slider::new(generations, 0..=16));
+                ui.add(egui::Slider::new(generations, 0..=20));
                 ui.horizontal(|ui| {
                     ui.label("Angle");
                     ui.add(
@@ -746,6 +772,16 @@ impl App {
                     );
                 });
                 ui.add_space(8.0);
+
+                if let Some(cache) = &self.lsys_cache {
+                    if cache.generations_done < *generations {
+                        ui.label(format!(
+                            "Symbol cap reached — showing generation {} of {}.",
+                            cache.generations_done, generations
+                        ));
+                    }
+                }
+                ui.separator();
 
                 ui.label("Presets");
                 let mut chosen: Option<&lsystem::Preset> = None;
@@ -800,8 +836,12 @@ impl App {
                 ui.add_space(4.0);
                 ui.small("F G draw · f g move · + - turn · [ ] branch");
 
+                let edited =
+                    before != (axiom.clone(), rules.clone(), *angle_deg, *generations);
                 if let Some(preset) = chosen {
                     self.apply_lsystem_preset(preset);
+                } else if edited {
+                    self.fit_lsystem_view();
                 }
             }
         }
@@ -983,7 +1023,8 @@ impl App {
                     // Keep the complex point under the pointer fixed.
                     let off = pos - rect.center();
                     let upp = self.view.units_per_point;
-                    let new_upp = (upp / factor).clamp(MIN_UNITS_PER_POINT, 0.1);
+                    let new_upp =
+                        (upp / factor).clamp(MIN_UNITS_PER_POINT, self.max_units_per_point());
                     self.view.center.offset(
                         off.x as f64 * (upp - new_upp),
                         -off.y as f64 * (upp - new_upp),
@@ -1311,7 +1352,9 @@ impl App {
                 && c.generations == generations
         });
         if !segs_valid {
-            let segments = lsystem::segments(&axiom, &rules, angle_deg, generations);
+            let (segments, generations_done) =
+                lsystem::segments(&axiom, &rules, angle_deg, generations);
+            let world_bounds = lsystem::bounds(&segments);
             let image = egui::ColorImage::filled([w, h], egui::Color32::BLACK);
             let texture =
                 ui.ctx()
@@ -1326,6 +1369,8 @@ impl App {
                 size: [0, 0], // forces the first rasterize below
                 palette,
                 segments,
+                generations_done,
+                world_bounds,
                 texture,
             });
         }

@@ -138,11 +138,12 @@ Built so far:
 - **More escape-time formulas** — Tricorn (Mandelbar, z̄²+c) and Multibrot (power 2–8) as variants of one shader iteration core. Deep zoom (perturbation) remains Mandelbrot-only — the z² algebra doesn't carry over — with a UI warning past f32 precision. Bookmark family tags: `tricorn`, `multibrot`.
 - **Palette presets** — named cosine-gradient palettes (Classic, Sunset, Fire, Electric, Pastel, Grayscale) selectable in the UI, shared by the escape-time color pass and the IFS tone-map; the frequency/phase sliders modulate any preset. One coefficient formula (`a + b·cos(2π(c·x + d))`) drives both the shader and the CPU mirror; `Classic` reproduces the original palette exactly (tested). The preset travels in bookmarks (`#[serde(default)]` — older bookmarks load as Classic); switching presets only re-runs the cheap color pass / tone-map.
 - **L-systems** (§3.2) — third fractal family: axiom + rewrite rules expanded
-  (capped at 4M symbols so runaway growth can't hang the UI) and interpreted
+  (capped at 16M symbols so runaway growth can't hang the UI) and interpreted
   as turtle graphics (`F G f g + - [ ]`); segments rasterized on the CPU
   (Liang–Barsky clip + DDA), colored by arc position through the shared
-  palette. Presets: Koch snowflake, dragon curve, Sierpinski arrowhead,
-  fractal plant. Full rule editing in the UI (axiom, per-symbol rules, angle,
+  palette. Nine presets: Koch snowflake/island, dragon, Hilbert, Gosper, and
+  Lévy C curves, Sierpinski arrowhead, plant, and bush.
+  Full rule editing in the UI (axiom, per-symbol rules, angle,
   generations); *Reset view* fits the drawing's bounds. Segments cache until
   the rule changes; pan/zoom/palette only re-rasterize. Bookmark family tag:
   `l_system`.

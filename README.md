@@ -39,9 +39,10 @@ zooming in.*
   view* fits the viewport to the attractor. (Visual drag-handle editing is
   planned, not built yet.)
 - **L-systems** — a third family: axiom + rewrite rules interpreted as turtle
-  graphics. Koch snowflake, dragon curve, Sierpinski arrowhead, and fractal
-  plant presets, plus a full rule editor (axiom, per-symbol rules, turn angle,
-  generations) — curves are colored along their length through the palette.
+  graphics. Nine presets — Koch snowflake and island, dragon, Hilbert, Gosper,
+  and Lévy C curves, Sierpinski arrowhead, and two plants — plus a full rule
+  editor (axiom, per-symbol rules, turn angle, generations); curves are
+  colored along their length through the palette.
 - **Progressive rendering** — interaction never stalls: the Mandelbrot view
   renders through a resolution ladder (coarse immediately, sharpening in
   place), and IFS images "develop" as the chaos game accumulates points each
