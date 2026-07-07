@@ -717,7 +717,13 @@ impl App {
 
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         ui.add_space(12.0);
-        ui.heading("FractalX");
+        ui.horizontal(|ui| {
+            ui.heading("FractalX");
+            ui.small(concat!("v", env!("CARGO_PKG_VERSION")));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::widgets::global_theme_preference_switch(ui);
+            });
+        });
         ui.add_space(16.0);
 
         // Family selection: a discriminant-only copy drives the combo box.
@@ -1037,7 +1043,8 @@ impl App {
         ui.separator();
         ui.add_space(4.0);
 
-        ui.label("Palette");
+        ui.strong("Palette");
+        ui.add_space(4.0);
         egui::ComboBox::from_id_salt("palette-preset")
             .selected_text(self.view.palette.name())
             .show_ui(ui, |ui| {
@@ -1052,6 +1059,8 @@ impl App {
 
         ui.add_space(12.0);
         ui.separator();
+        ui.add_space(4.0);
+        ui.strong("Position");
         ui.add_space(4.0);
         let zoom = 0.004 / self.view.units_per_point;
         let digits = (zoom.log10().max(0.0) as usize) + 6;
@@ -1085,16 +1094,23 @@ impl App {
                         }
                     });
                 }
-                if self.coord_edit.dirty {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Go").clicked() {
-                            apply = true;
-                        }
-                        if ui.small_button("Revert").clicked() {
-                            self.coord_edit.dirty = false;
-                        }
-                    });
-                }
+                // Always present (disabled while the fields mirror the view)
+                // so the layout doesn't jump when typing starts.
+                let dirty = self.coord_edit.dirty;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(dirty, egui::Button::new("Go").small())
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui
+                        .add_enabled(dirty, egui::Button::new("Revert").small())
+                        .clicked()
+                    {
+                        self.coord_edit.dirty = false;
+                    }
+                });
                 if apply {
                     self.apply_coords();
                 }
@@ -1130,7 +1146,10 @@ impl App {
         if let Some((done, points)) = density_progress {
             if done < points {
                 ui.add_space(4.0);
-                ui.small(format!("rendering… {}%", 100 * done / points.max(1)));
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / points.max(1) as f32)
+                        .show_percentage(),
+                );
             }
         }
         if self.perturbation_active() {
@@ -1158,7 +1177,7 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(4.0);
-        ui.heading("Export");
+        ui.strong("Export");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.add(
@@ -1706,9 +1725,12 @@ impl eframe::App for App {
 
         // Exact width: content (e.g. focused full-width text fields) must
         // never widen the panel over the canvas.
+        let panel_frame = egui::Frame::side_top_panel(ui.style())
+            .inner_margin(egui::Margin::symmetric(16, 8));
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(260.0)
+            .frame(panel_frame)
             .show(ui, |ui| {
                 // Scroll instead of clipping when the window is too short
                 // for the full control stack.
