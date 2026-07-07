@@ -208,6 +208,11 @@ fn cs_chunk(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---- Color pass ------------------------------------------------------------
 
 struct PaletteUniforms {
+    // Cosine-gradient coefficient rows (vec4 for alignment; .w unused).
+    a: vec4<f32>,
+    b: vec4<f32>,
+    c: vec4<f32>,
+    d: vec4<f32>,
     freq: f32,
     phase: f32,
     _pad: vec2<f32>,
@@ -219,9 +224,9 @@ var data_tex: texture_2d<f32>;
 var<uniform> pal: PaletteUniforms;
 
 fn palette(t: f32) -> vec3<f32> {
-    // Cyclic cosine palette.
-    let phase = vec3<f32>(0.0, 0.33, 0.67) + pal.phase;
-    return 0.5 + 0.5 * cos(6.2831853 * (t * pal.freq + phase));
+    // Cyclic cosine gradient: a + b*cos(2*pi*(c*x + d)).
+    let x = t * pal.freq + pal.phase;
+    return pal.a.xyz + pal.b.xyz * cos(6.2831853 * (pal.c.xyz * x + pal.d.xyz));
 }
 
 @fragment

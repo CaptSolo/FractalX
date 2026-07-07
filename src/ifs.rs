@@ -285,19 +285,14 @@ pub fn attractor_bbox(maps: &[AffineMap], samples: u64) -> Option<[f64; 4]> {
     (plotted > 0).then_some([min_x, min_y, max_x, max_y])
 }
 
-/// CPU mirror of the shader's cyclic cosine palette.
-fn palette(t: f32, freq: f32, phase: f32) -> [u8; 3] {
-    let mut rgb = [0u8; 3];
-    for (i, base) in [0.0f32, 0.33, 0.67].iter().enumerate() {
-        let v = 0.5 + 0.5 * (6.2831853 * (t * freq + base + phase)).cos();
-        rgb[i] = (v.clamp(0.0, 1.0) * 255.0) as u8;
-    }
-    rgb
-}
-
 /// Tone-map a histogram to RGBA: log-scaled density through the palette,
 /// black background.
-pub fn tonemap_rgba(hist: &[u32], palette_freq: f32, palette_phase: f32) -> Vec<u8> {
+pub fn tonemap_rgba(
+    hist: &[u32],
+    palette: crate::palette::Palette,
+    palette_freq: f32,
+    palette_phase: f32,
+) -> Vec<u8> {
     let max = hist.iter().copied().max().unwrap_or(0).max(1) as f32;
     let inv_log_max = 1.0 / (1.0 + max).ln();
     let mut rgba = Vec::with_capacity(hist.len() * 4);
@@ -306,7 +301,7 @@ pub fn tonemap_rgba(hist: &[u32], palette_freq: f32, palette_phase: f32) -> Vec<
             rgba.extend_from_slice(&[0, 0, 0, 255]);
         } else {
             let t = (1.0 + n as f32).ln() * inv_log_max;
-            let [r, g, b] = palette(t, palette_freq, palette_phase);
+            let [r, g, b] = palette.eval(t, palette_freq, palette_phase);
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
@@ -420,7 +415,7 @@ mod tests {
 
     #[test]
     fn tonemap_maps_zero_to_black_and_scales() {
-        let rgba = tonemap_rgba(&[0, 1, 100], 1.0, 0.0);
+        let rgba = tonemap_rgba(&[0, 1, 100], crate::palette::Palette::Classic, 1.0, 0.0);
         assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
         assert_ne!(&rgba[4..7], &[0, 0, 0]);
         assert_eq!(rgba.len(), 12);

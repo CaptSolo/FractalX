@@ -20,9 +20,13 @@ zooming in.*
 
 - **GPU-rendered escape-time explorer** — Mandelbrot, Tricorn (Mandelbar),
   and Multibrot (power 2–8): smooth pan (drag) and zoom (scroll/pinch,
-  anchored at the pointer), iteration depth up to 100,000, adjustable cyclic
-  color palette, and exact coordinate entry (paste a 40-digit deep-zoom
-  location and jump straight there).
+  anchored at the pointer), iteration depth up to 100,000, and exact
+  coordinate entry (paste a 40-digit deep-zoom location and jump straight
+  there).
+- **Color palettes** — six cosine-gradient presets (Classic, Sunset, Fire,
+  Electric, Pastel, Grayscale) with frequency and phase controls, shared by
+  the escape-time and IFS renderers. Palette changes re-colorize instantly —
+  the fractal is never re-computed.
 - **Deep zoom via perturbation theory** — a single reference orbit is computed
   on the CPU in arbitrary-precision arithmetic; the GPU iterates only each
   pixel's tiny delta in f32, with rebasing. Precision scales automatically
@@ -70,7 +74,8 @@ cargo test
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |
-| Iterations / points / palette | sliders in the left panel |
+| Iterations / points | sliders in the left panel |
+| Change colors | *Palette* dropdown + frequency/phase sliders |
 | Edit an IFS | preset buttons, then tweak the affine-map coefficients |
 | Export image | set resolution, *Export PNG…* |
 | Reopen an exported view | *Open PNG bookmark…* |

@@ -5,6 +5,7 @@ mod deep;
 mod export;
 mod ifs;
 mod mandelbrot;
+mod palette;
 
 use eframe::egui;
 use eframe::wgpu;
@@ -78,6 +79,9 @@ struct ViewState {
     max_iter: u32,
     palette_freq: f32,
     palette_phase: f32,
+    /// Absent in older bookmarks, which used the (now `Classic`) palette.
+    #[serde(default)]
+    palette: palette::Palette,
     /// Absent in v1/v2 bookmarks, which are always Mandelbrot.
     #[serde(default)]
     rule: FractalRule,
@@ -91,6 +95,7 @@ impl Default for ViewState {
             max_iter: 300,
             palette_freq: 1.0,
             palette_phase: 0.0,
+            palette: palette::Palette::Classic,
             rule: FractalRule::Mandelbrot,
         }
     }
@@ -152,7 +157,7 @@ struct IfsCache {
     size: [usize; 2],
     maps: Vec<ifs::AffineMap>,
     // Tone-map key
-    palette: (f32, f32),
+    palette: (palette::Palette, f32, f32),
 
     game: ifs::ChaosGame,
     done: u64,
@@ -176,7 +181,7 @@ struct ChunkJob {
 struct MandelProgressive {
     /// Iteration-uniform bytes + full-resolution pixel size: the view.
     key: ([u8; std::mem::size_of::<Uniforms>()], [u32; 2]),
-    palette: (f32, f32),
+    palette: (palette::Palette, f32, f32),
     /// Current rung: divisor is 1 << level, 0 = full resolution.
     level: u32,
     /// Chunked iteration in progress for the current rung.
@@ -339,7 +344,12 @@ impl App {
     }
 
     fn palette_uniforms(&self) -> mandelbrot::PaletteUniforms {
+        let [a, b, c, d] = self.view.palette.coeffs();
         mandelbrot::PaletteUniforms {
+            a,
+            b,
+            c,
+            d,
             freq: self.view.palette_freq,
             phase: self.view.palette_phase,
             _pad: [0.0; 2],
@@ -395,7 +405,12 @@ impl App {
                     let points = ((*points as f64 * scale) as u64).min(200_000_000);
                     let hist =
                         ifs::chaos_histogram(maps, points, view, w as usize, h as usize);
-                    ifs::tonemap_rgba(&hist, self.view.palette_freq, self.view.palette_phase)
+                    ifs::tonemap_rgba(
+                        &hist,
+                        self.view.palette,
+                        self.view.palette_freq,
+                        self.view.palette_phase,
+                    )
                 }
             };
 
@@ -616,6 +631,14 @@ impl App {
         }
         ui.add_space(8.0);
 
+        ui.label("Palette");
+        egui::ComboBox::from_id_salt("palette-preset")
+            .selected_text(self.view.palette.name())
+            .show_ui(ui, |ui| {
+                for p in palette::Palette::ALL {
+                    ui.selectable_value(&mut self.view.palette, p, p.name());
+                }
+            });
         ui.label("Palette frequency");
         ui.add(egui::Slider::new(&mut self.view.palette_freq, 0.1..=8.0).logarithmic(true));
         ui.label("Palette phase");
@@ -845,7 +868,11 @@ impl App {
             ((rect.height() * ppp) as u32).clamp(16, 8192),
         ];
         let uniforms = self.uniforms_for_size(rect.width() as f64, rect.height() as f64);
-        let palette = (self.view.palette_freq, self.view.palette_phase);
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
         let mut key_bytes = [0u8; std::mem::size_of::<Uniforms>()];
         key_bytes.copy_from_slice(bytemuck::bytes_of(&uniforms));
         let key = (key_bytes, full);
@@ -1001,7 +1028,11 @@ impl App {
         let h = ((rect.height() as f64 * ppp) as usize).clamp(16, 4096);
         let center = self.view.center.to_f64();
         let units_per_pixel = self.view.units_per_point / ppp;
-        let palette = (self.view.palette_freq, self.view.palette_phase);
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
 
         // Anything that changes the histogram restarts the accumulation.
         // (Lowering the target below what's done also restarts, to stay
@@ -1050,7 +1081,7 @@ impl App {
             retonemap = true;
         }
         if retonemap {
-            let rgba = ifs::tonemap_rgba(&cache.hist, palette.0, palette.1);
+            let rgba = ifs::tonemap_rgba(&cache.hist, palette.0, palette.1, palette.2);
             cache.texture.set(
                 egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
                 egui::TextureOptions::LINEAR,
@@ -1098,6 +1129,7 @@ mod tests {
         let b: Bookmark = serde_json::from_str(json).unwrap();
         assert!(matches!(b.view.rule, FractalRule::Mandelbrot));
         assert_eq!(b.view.max_iter, 5000);
+        assert_eq!(b.view.palette, palette::Palette::Classic);
     }
 
     #[test]

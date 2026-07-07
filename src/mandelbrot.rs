@@ -40,6 +40,11 @@ pub const STATE_BYTES_PER_PIXEL: u64 = 32;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PaletteUniforms {
+    /// Cosine-gradient coefficient rows (a, b, c, d), padded to vec4.
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+    pub c: [f32; 4],
+    pub d: [f32; 4],
     pub freq: f32,
     pub phase: f32,
     pub _pad: [f32; 2],
@@ -577,10 +582,17 @@ impl RenderResources {
 mod tests {
     use super::*;
 
-    const PAL: PaletteUniforms = PaletteUniforms {
-        freq: 1.0,
-        phase: 0.0,
-        _pad: [0.0; 2],
+    const PAL: PaletteUniforms = {
+        let [a, b, c, d] = crate::palette::Palette::Classic.coeffs();
+        PaletteUniforms {
+            a,
+            b,
+            c,
+            d,
+            freq: 1.0,
+            phase: 0.0,
+            _pad: [0.0; 2],
+        }
     };
 
     /// Headless GPU round trip: render offscreen, check the image is a
