@@ -68,6 +68,17 @@ Requires a stable Rust toolchain. On Windows, the MSVC toolchain also needs
 "Build Tools for Visual Studio" with the *Desktop development with C++*
 workload (for `link.exe`).
 
+On Linux (untested — reports welcome), install the windowing build
+dependencies first; on Debian/Ubuntu:
+
+```sh
+sudo apt install libxkbcommon-dev libwayland-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
+
+At runtime you'll need working Vulkan drivers; file dialogs use the
+`xdg-desktop-portal` service (present on all major desktops).
+
 ```sh
 cargo run --release
 ```
