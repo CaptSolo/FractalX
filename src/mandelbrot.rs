@@ -8,6 +8,7 @@ use eframe::egui_wgpu::wgpu;
 pub const FORMULA_MANDELBROT: u32 = 0;
 pub const FORMULA_TRICORN: u32 = 1;
 pub const FORMULA_MULTIBROT: u32 = 2;
+pub const FORMULA_JULIA: u32 = 3;
 
 /// Iteration (data pass) uniforms. Layout must match `mandelbrot.wgsl`.
 #[repr(C)]
@@ -16,6 +17,7 @@ pub struct Uniforms {
     pub center: [f32; 2],
     pub half_extent: [f32; 2],
     pub dc_offset: [f32; 2],
+    pub julia_c: [f32; 2],
     pub max_iter: u32,
     pub ref_len: u32,
     pub use_perturb: u32,
@@ -611,6 +613,7 @@ mod tests {
             center: [-0.5, 0.0],
             half_extent: [1.6, 1.2],
             dc_offset: [0.0, 0.0],
+            julia_c: [0.0, 0.0],
             max_iter: 200,
             ref_len: 0,
             use_perturb: 0,
@@ -648,6 +651,7 @@ mod tests {
             center: [-0.65, 0.35],
             half_extent: [0.05, 0.05],
             dc_offset: [0.0, 0.0],
+            julia_c: [0.0, 0.0],
             max_iter: 3000,
             ref_len: 0,
             use_perturb: 0,
@@ -715,7 +719,7 @@ mod tests {
 
         let resources = RenderResources::new(&device);
         let (w, h) = (96u32, 96u32);
-        let render = |formula: u32, power: u32| {
+        let render = |formula: u32, power: u32, julia_c: [f32; 2]| {
             resources.render_offscreen(
                 &device,
                 &queue,
@@ -723,6 +727,7 @@ mod tests {
                     center: [-0.4, 0.0],
                     half_extent: [1.8, 1.8],
                     dc_offset: [0.0, 0.0],
+                    julia_c,
                     max_iter: 200,
                     ref_len: 0,
                     use_perturb: 0,
@@ -736,11 +741,17 @@ mod tests {
             )
         };
 
-        let mandel = render(FORMULA_MANDELBROT, 2);
-        let tricorn = render(FORMULA_TRICORN, 2);
-        let multi = render(FORMULA_MULTIBROT, 4);
+        let mandel = render(FORMULA_MANDELBROT, 2, [0.0, 0.0]);
+        let tricorn = render(FORMULA_TRICORN, 2, [0.0, 0.0]);
+        let multi = render(FORMULA_MULTIBROT, 4, [0.0, 0.0]);
+        // c inside the main cardioid: connected Julia set with interior.
+        let julia = render(FORMULA_JULIA, 2, [-0.4, 0.6]);
 
-        for (name, img) in [("tricorn", &tricorn), ("multibrot", &multi)] {
+        for (name, img) in [
+            ("tricorn", &tricorn),
+            ("multibrot", &multi),
+            ("julia", &julia),
+        ] {
             assert_ne!(&mandel, img, "{name} identical to mandelbrot");
             // Has both interior (black) and escaped (colored) pixels.
             let black = img
@@ -773,6 +784,7 @@ mod tests {
             center: [-0.65, 0.35],
             half_extent: [0.02, 0.02],
             dc_offset: [0.0, 0.0],
+            julia_c: [0.0, 0.0],
             max_iter,
             ref_len: 0,
             use_perturb: 0,
@@ -848,6 +860,7 @@ mod tests {
                 center: [0.0, 0.0], // unused on the perturbation path
                 half_extent: [1e-14, 1e-14],
                 dc_offset: [0.0, 0.0],
+                julia_c: [0.0, 0.0],
                 max_iter,
                 ref_len: orbit.points.len() as u32,
                 use_perturb: 1,

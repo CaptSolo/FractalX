@@ -149,6 +149,18 @@ Built so far:
   shows when the symbol cap cuts expansion short of the requested
   generations. Segments cache until the rule changes; pan/zoom/palette only
   re-rasterize. Bookmark family tag: `l_system`.
+- **Julia sets** (§3.1) — fourth escape-time formula: the pixel seeds `z`
+  and `c` is a fixed constant (chosen numerically or via eleven classic
+  presets — Basilica, San Marco, Airplane, Douady Rabbit, the c=i dendrite,
+  and more). Shares the full two-pass/chunked/progressive
+  pipeline; f32-precision warning past ~3e4 zoom like the other non-Mandelbrot
+  formulas. Bookmark family tag: `julia`.
+- **Strange attractors** — Clifford and de Jong maps rendered as density
+  plots through the IFS histogram/tone-map pipeline, but fully deterministic
+  (no RNG: 16 fixed-seed orbits, cumulative work splitting — batch-split and
+  thread-count invariant, tested). Four presets, numeric a/b/c/d editing
+  (edits refit the viewport), progressive accumulation, CPU export with the
+  point budget scaled to pixel count. Bookmark family tag: `attractor`.
 - **Iteration chunking** (§4.1 second layer) — above 2048 iterations, a ladder rung renders via a compute shader that advances every pixel by 2048 iterations per frame, persisting per-pixel state in a storage buffer (`ceil(max_iter/chunk)` dispatches guarantee completion — no readback). No single dispatch can stall the GPU at 100k iterations. Chunk resumption is bit-exact vs. a single dispatch (tested); fragment and compute variants differ by driver-level float jitter on ~1% boundary pixels (tolerated in tests).
 
 Not yet started: background-thread reference-orbit computation (recompute still hitches one frame at extreme depth); visual (drag-handle) editing of IFS maps — the §3.2 signature feature; deterministic shape-iteration IFS view; Julia companion pane; bookmarks journal; palette editor; custom formula expressions; natural/statistical module; measurement tools.

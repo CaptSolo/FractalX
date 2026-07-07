@@ -27,6 +27,10 @@ built vs. pending; keep it updated when a milestone lands.
   perturbation reference orbit. Precision auto-scales: zoom bits + 64 guard bits.
 - `src/ifs.rs` — IFS chaos game: 16 fixed-seed walkers over rayon, atomic
   scatter-adds into a shared histogram; log tone-map through the shared palette.
+- `src/attractor.rs` — strange attractors (Clifford, de Jong): same density
+  pipeline as the chaos game (16 fixed lanes, cumulative work splitting,
+  reuses `ifs::tonemap_rgba`) but fully deterministic — no RNG, fixed seed
+  points per lane.
 - `src/lsystem.rs` — L-systems: rewrite expansion (capped at `MAX_SYMBOLS` —
   returns the last complete generation, never a truncated string), turtle
   interpretation (`F G f g + - [ ]`), CPU rasterization (Liang–Barsky clip +
@@ -37,9 +41,11 @@ built vs. pending; keep it updated when a milestone lands.
   tone-map. `Classic` must stay bit-identical to the original palette
   (tested) — old bookmarks default to it via `#[serde(default)]`.
 - `src/export.rs` — PNG with the bookmark embedded as an iTXt chunk.
-- Formulas: Mandelbrot / Tricorn / Multibrot share one shader iteration core
-  (`step_plain` switch); adding a formula touches the shader switch, the
-  `FractalRule` enum, and `uniforms_for_size` only.
+- Formulas: Mandelbrot / Tricorn / Multibrot / Julia share one shader
+  iteration core (`step_plain` switch); adding a formula touches the shader
+  switch, the `FractalRule` enum, and `uniforms_for_size` only. (Julia also
+  seeds `z` from the pixel via `initial_state` and iterates a constant
+  `julia_c` uniform.)
 - Spec rule: fractal families are pluggable modules; adding a family must not
   touch core code (`main.rs` state/scheduling, export).
 

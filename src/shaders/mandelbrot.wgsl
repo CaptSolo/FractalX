@@ -19,10 +19,11 @@ struct Uniforms {
     center: vec2<f32>,      // complex canvas center (plain path only)
     half_extent: vec2<f32>, // complex half width/height of the visible region
     dc_offset: vec2<f32>,   // canvas center minus reference point (perturbation)
+    julia_c: vec2<f32>,     // Julia constant (formula 3 only)
     max_iter: u32,
     ref_len: u32,           // number of valid entries in ref_orbit
     use_perturb: u32,       // 0 = plain path, 1 = perturbation path
-    formula: u32,           // 0 = Mandelbrot, 1 = Tricorn, 2 = Multibrot
+    formula: u32,           // 0 = Mandelbrot, 1 = Tricorn, 2 = Multibrot, 3 = Julia
     power: u32,             // Multibrot exponent (>= 2)
     _pad: u32,
 };
@@ -79,6 +80,9 @@ fn step_plain(z: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
             }
             return w + c;
         }
+        case 3u: { // Julia: z^2 + fixed constant (the pixel seeds z instead)
+            return cmul(z, z) + u.julia_c;
+        }
         default: {
             return cmul(z, z) + c;
         }
@@ -96,6 +100,16 @@ struct IterState {
 
 fn fresh_state() -> IterState {
     return IterState(vec2<f32>(0.0, 0.0), 0u, 0u, 0u, RUNNING);
+}
+
+// Initial state for the pixel at `uv`: z = 0 for the c-plane formulas;
+// Julia iterates the pixel's plane coordinate instead (c is a constant).
+fn initial_state(uv: vec2<f32>) -> IterState {
+    var s = fresh_state();
+    if u.formula == 3u {
+        s.z = pixel_cc(uv);
+    }
+    return s;
 }
 
 // Advance a pixel by up to `budget` iterations. `cc` is c (plain) or the
@@ -160,7 +174,7 @@ fn pixel_cc(uv: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_data(in: VertexOut) -> @location(0) vec4<f32> {
-    var s = fresh_state();
+    var s = initial_state(in.uv);
     iterate(&s, pixel_cc(in.uv), u.max_iter);
     return vec4<f32>(s.result, 0.0, 0.0, 1.0);
 }
@@ -187,9 +201,10 @@ fn cs_chunk(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let idx = gid.y * cp.size.x + gid.x;
 
+    let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(cp.size);
     var s: IterState;
     if cp.reset == 1u {
-        s = fresh_state();
+        s = initial_state(uv);
     } else {
         s = cells[idx];
         if s.done == 1u {
@@ -197,7 +212,6 @@ fn cs_chunk(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(cp.size);
     iterate(&s, pixel_cc(uv), cp.chunk_iters);
 
     // RUNNING renders as interior (black) until the pixel resolves.

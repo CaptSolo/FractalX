@@ -19,10 +19,10 @@ zooming in.*
 ## Features
 
 - **GPU-rendered escape-time explorer** — Mandelbrot, Tricorn (Mandelbar),
-  and Multibrot (power 2–8): smooth pan (drag) and zoom (scroll/pinch,
-  anchored at the pointer), iteration depth up to 100,000, and exact
-  coordinate entry (paste a 40-digit deep-zoom location and jump straight
-  there).
+  Multibrot (power 2–8), and Julia sets (pick the constant numerically or
+  from classic presets): smooth pan (drag) and zoom (scroll/pinch, anchored
+  at the pointer), iteration depth up to 100,000, and exact coordinate entry
+  (paste a 40-digit deep-zoom location and jump straight there).
 - **Color palettes** — six cosine-gradient presets (Classic, Sunset, Fire,
   Electric, Pastel, Grayscale) with frequency and phase controls, shared by
   the escape-time and IFS renderers. Palette changes re-colorize instantly —
@@ -43,10 +43,13 @@ zooming in.*
   and Lévy C curves, Sierpinski arrowhead, and two plants — plus a full rule
   editor (axiom, per-symbol rules, turn angle, generations); curves are
   colored along their length through the palette.
+- **Strange attractors** — Clifford and de Jong maps as glowing density
+  plots, computed across all CPU cores with fully deterministic output;
+  four presets plus live numeric editing of the map parameters.
 - **Progressive rendering** — interaction never stalls: the Mandelbrot view
   renders through a resolution ladder (coarse immediately, sharpening in
-  place), and IFS images "develop" as the chaos game accumulates points each
-  frame.
+  place), and density images (IFS, attractors) "develop" as points accumulate
+  each frame.
 - **PNG export with embedded bookmarks** — renders offscreen at any resolution
   (up to 16K), independent of the window. The complete view state (center
   coordinates at full precision, zoom, iterations, palette) is embedded in the
@@ -76,7 +79,7 @@ cargo test
 
 | Action | Input |
 |---|---|
-| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / IFS / L-system) |
+| Switch fractal family | *Family* dropdown (Mandelbrot / Tricorn / Multibrot / Julia / IFS / L-system / Strange attractor) |
 | Pan | drag the canvas |
 | Zoom | scroll wheel or trackpad pinch (anchored at pointer) |
 | Jump to exact coordinates | type into the *re / im / zoom* fields, press Enter |

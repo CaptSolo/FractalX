@@ -1,6 +1,7 @@
 //! FractalX — fractal explorer prototype.
 //! Milestone 1: GPU Mandelbrot with smooth pan/zoom, iteration and palette controls.
 
+mod attractor;
 mod deep;
 mod export;
 mod ifs;
@@ -36,6 +37,10 @@ enum FractalRule {
     Multibrot {
         power: u32,
     },
+    Julia {
+        /// The fixed constant c; the pixel seeds z instead.
+        c: [f64; 2],
+    },
     Ifs {
         maps: Vec<ifs::AffineMap>,
         points: u64,
@@ -46,13 +51,21 @@ enum FractalRule {
         angle_deg: f64,
         generations: u32,
     },
+    Attractor {
+        kind: attractor::Kind,
+        /// Map parameters a, b, c, d.
+        params: [f64; 4],
+        points: u64,
+    },
 }
 
 impl FractalRule {
     fn is_escape_time(&self) -> bool {
         !matches!(
             self,
-            FractalRule::Ifs { .. } | FractalRule::LSystem { .. }
+            FractalRule::Ifs { .. }
+                | FractalRule::LSystem { .. }
+                | FractalRule::Attractor { .. }
         )
     }
 
@@ -61,8 +74,10 @@ impl FractalRule {
             FractalRule::Mandelbrot => "Mandelbrot",
             FractalRule::Tricorn => "Tricorn",
             FractalRule::Multibrot { .. } => "Multibrot",
+            FractalRule::Julia { .. } => "Julia",
             FractalRule::Ifs { .. } => "IFS (chaos game)",
             FractalRule::LSystem { .. } => "L-system",
+            FractalRule::Attractor { .. } => "Strange attractor",
         }
     }
 
@@ -72,9 +87,12 @@ impl FractalRule {
             FractalRule::Mandelbrot => ([-0.5, 0.0], 0.004),
             FractalRule::Tricorn => ([-0.25, 0.0], 0.005),
             FractalRule::Multibrot { .. } => ([0.0, 0.0], 0.004),
+            FractalRule::Julia { .. } => ([0.0, 0.0], 0.004),
             FractalRule::Ifs { .. } => ([0.5, 0.43], 0.0016),
             // Placeholder; L-system views are fitted to the drawing's bounds.
             FractalRule::LSystem { .. } => ([0.0, 0.0], 0.01),
+            // Placeholder; attractor views are fitted to the orbit's bounds.
+            FractalRule::Attractor { .. } => ([0.0, 0.0], 0.006),
         }
     }
 }
@@ -178,6 +196,25 @@ struct IfsCache {
     texture: egui::TextureHandle,
 }
 
+/// Progressive strange-attractor render, mirroring `IfsCache`: deterministic
+/// orbits fill the histogram over frames; the tone-map re-runs on palette
+/// changes without re-iterating.
+struct AttractorCache {
+    // Histogram key (a change invalidates everything)
+    kind: attractor::Kind,
+    params: [f64; 4],
+    center: [f64; 2],
+    units_per_pixel: f64,
+    size: [usize; 2],
+    // Tone-map key
+    palette: (palette::Palette, f32, f32),
+
+    orbits: attractor::Orbits,
+    done: u64,
+    hist: Vec<u32>,
+    texture: egui::TextureHandle,
+}
+
 /// Cached L-system render: turtle segments (recomputed only when the rule
 /// changes) plus the last rasterized image (recomputed when the view, size,
 /// or palette changes — rasterizing is cheap next to expansion).
@@ -253,6 +290,7 @@ struct App {
     orbit: Option<OrbitCache>,
     ifs_cache: Option<IfsCache>,
     lsys_cache: Option<LsysCache>,
+    attr_cache: Option<AttractorCache>,
     mandel_prog: Option<MandelProgressive>,
 }
 
@@ -277,6 +315,7 @@ impl App {
             orbit: None,
             ifs_cache: None,
             lsys_cache: None,
+            attr_cache: None,
             mandel_prog: None,
         }
     }
@@ -310,6 +349,22 @@ impl App {
             return;
         };
         if let Some([min_x, min_y, max_x, max_y]) = ifs::attractor_bbox(maps, 20_000) {
+            let w = (max_x - min_x).max(1e-6);
+            let h = (max_y - min_y).max(1e-6);
+            self.view.center =
+                deep::BigComplex::from_f64((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+            let upp_w = w / self.canvas_size.x.max(1.0) as f64;
+            let upp_h = h / self.canvas_size.y.max(1.0) as f64;
+            self.view.units_per_point = upp_w.max(upp_h) * 1.1;
+        }
+    }
+
+    /// Fit the viewport to the strange attractor's bounding box.
+    fn fit_attractor_view(&mut self) {
+        let FractalRule::Attractor { kind, params, .. } = &self.view.rule else {
+            return;
+        };
+        if let Some([min_x, min_y, max_x, max_y]) = attractor::bbox(*kind, *params, 20_000) {
             let w = (max_x - min_x).max(1e-6);
             let h = (max_y - min_y).max(1e-6);
             self.view.center =
@@ -402,18 +457,22 @@ impl App {
             _ => (0, [0.0, 0.0], 0),
         };
 
-        let (formula, power) = match self.view.rule {
-            FractalRule::Tricorn => (mandelbrot::FORMULA_TRICORN, 2),
+        let (formula, power, julia_c) = match self.view.rule {
+            FractalRule::Tricorn => (mandelbrot::FORMULA_TRICORN, 2, [0.0; 2]),
             FractalRule::Multibrot { power } => {
-                (mandelbrot::FORMULA_MULTIBROT, power.max(2))
+                (mandelbrot::FORMULA_MULTIBROT, power.max(2), [0.0; 2])
             }
-            _ => (mandelbrot::FORMULA_MANDELBROT, 2),
+            FractalRule::Julia { c } => {
+                (mandelbrot::FORMULA_JULIA, 2, [c[0] as f32, c[1] as f32])
+            }
+            _ => (mandelbrot::FORMULA_MANDELBROT, 2, [0.0; 2]),
         };
 
         Uniforms {
             center: [center[0] as f32, center[1] as f32],
             half_extent: [half_w as f32, half_h as f32],
             dc_offset,
+            julia_c,
             max_iter: self.view.max_iter,
             ref_len,
             use_perturb,
@@ -451,7 +510,8 @@ impl App {
             let pixels = match &self.view.rule {
                 FractalRule::Mandelbrot
                 | FractalRule::Tricorn
-                | FractalRule::Multibrot { .. } => {
+                | FractalRule::Multibrot { .. }
+                | FractalRule::Julia { .. } => {
                     let render_state = frame
                         .wgpu_render_state
                         .as_ref()
@@ -485,6 +545,37 @@ impl App {
                     let points = ((*points as f64 * scale) as u64).min(200_000_000);
                     let hist =
                         ifs::chaos_histogram(maps, points, view, w as usize, h as usize);
+                    ifs::tonemap_rgba(
+                        &hist,
+                        self.view.palette,
+                        self.view.palette_freq,
+                        self.view.palette_phase,
+                    )
+                }
+                FractalRule::Attractor {
+                    kind,
+                    params,
+                    points,
+                } => {
+                    // Same vertical framing as the canvas; point budget
+                    // scaled to pixel count like IFS.
+                    let world_h = self.view.units_per_point * self.canvas_size.y as f64;
+                    let view = ifs::IfsView {
+                        center: self.view.center.to_f64(),
+                        units_per_pixel: world_h / h as f64,
+                    };
+                    let canvas_px =
+                        (self.canvas_size.x * self.canvas_size.y).max(1.0) as f64;
+                    let scale = ((w * h) as f64 / canvas_px).max(1.0);
+                    let points = ((*points as f64 * scale) as u64).min(500_000_000);
+                    let hist = attractor::histogram(
+                        *kind,
+                        *params,
+                        points,
+                        view,
+                        w as usize,
+                        h as usize,
+                    );
                     ifs::tonemap_rgba(
                         &hist,
                         self.view.palette,
@@ -599,6 +690,20 @@ impl App {
         self.view.units_per_point = preset.units_per_point;
     }
 
+    /// Switch to the given attractor preset and fit the viewport to it.
+    fn apply_attractor_preset(&mut self, preset: &attractor::Preset) {
+        let points = match &self.view.rule {
+            FractalRule::Attractor { points, .. } => *points,
+            _ => 5_000_000,
+        };
+        self.view.rule = FractalRule::Attractor {
+            kind: preset.kind,
+            params: preset.params,
+            points,
+        };
+        self.fit_attractor_view();
+    }
+
     /// Switch to the given L-system preset and fit the viewport to it.
     fn apply_lsystem_preset(&mut self, preset: &lsystem::Preset) {
         self.view.rule = FractalRule::LSystem {
@@ -616,10 +721,11 @@ impl App {
 
         // Family selection: a discriminant-only copy drives the combo box.
         let mut selected = std::mem::discriminant(&self.view.rule);
-        let choices: [FractalRule; 5] = [
+        let choices: [FractalRule; 7] = [
             FractalRule::Mandelbrot,
             FractalRule::Tricorn,
             FractalRule::Multibrot { power: 3 },
+            FractalRule::Julia { c: [-0.8, 0.156] },
             FractalRule::Ifs {
                 maps: vec![],
                 points: 0,
@@ -629,6 +735,11 @@ impl App {
                 rules: vec![],
                 angle_deg: 0.0,
                 generations: 0,
+            },
+            FractalRule::Attractor {
+                kind: attractor::Kind::Clifford,
+                params: [0.0; 4],
+                points: 0,
             },
         ];
         egui::ComboBox::from_label("Family")
@@ -651,6 +762,8 @@ impl App {
                 self.apply_preset(&ifs::PRESETS[0]);
             } else if matches!(chosen, FractalRule::LSystem { .. }) {
                 self.apply_lsystem_preset(&lsystem::PRESETS[0]);
+            } else if matches!(chosen, FractalRule::Attractor { .. }) {
+                self.apply_attractor_preset(&attractor::PRESETS[0]);
             } else {
                 let (center, upp) = chosen.home_view();
                 self.view.rule = chosen;
@@ -658,6 +771,7 @@ impl App {
                 self.view.units_per_point = upp;
                 self.ifs_cache = None;
                 self.lsys_cache = None;
+                self.attr_cache = None;
             }
             self.orbit = None;
             self.coord_edit.dirty = false;
@@ -678,6 +792,40 @@ impl App {
                 );
                 ui.label("Power");
                 ui.add(egui::Slider::new(power, 2..=8));
+            }
+            FractalRule::Julia { c } => {
+                ui.label("Max iterations");
+                ui.add(
+                    egui::Slider::new(&mut self.view.max_iter, 50..=100_000).logarithmic(true),
+                );
+                ui.label("c  (z → z² + c)");
+                ui.horizontal(|ui| {
+                    ui.label("re");
+                    ui.add(egui::DragValue::new(&mut c[0]).speed(0.001).max_decimals(5));
+                    ui.label("im");
+                    ui.add(egui::DragValue::new(&mut c[1]).speed(0.001).max_decimals(5));
+                });
+                ui.add_space(4.0);
+                ui.label("Presets");
+                ui.horizontal_wrapped(|ui| {
+                    for (name, preset) in [
+                        ("Dendrite", [-0.8, 0.156]),
+                        ("Rabbit", [-0.123, 0.745]),
+                        ("Siegel", [-0.391, -0.587]),
+                        ("Spiral", [0.285, 0.01]),
+                        ("Dust", [-0.4, 0.6]),
+                        ("Basilica", [-1.0, 0.0]),
+                        ("San Marco", [-0.75, 0.0]),
+                        ("Airplane", [-1.755, 0.0]),
+                        ("Galaxy", [-0.7269, 0.1889]),
+                        ("Dragon", [-0.835, -0.2321]),
+                        ("Lightning", [0.0, 1.0]),
+                    ] {
+                        if ui.small_button(name).clicked() {
+                            *c = preset;
+                        }
+                    }
+                });
             }
             FractalRule::Ifs { maps, points } => {
                 ui.label("Points");
@@ -844,6 +992,45 @@ impl App {
                     self.fit_lsystem_view();
                 }
             }
+            FractalRule::Attractor {
+                kind,
+                params,
+                points,
+            } => {
+                ui.label("Points");
+                ui.add(
+                    egui::Slider::new(points, 100_000..=50_000_000)
+                        .logarithmic(true),
+                );
+                ui.add_space(8.0);
+
+                ui.label("Presets");
+                let mut chosen: Option<&attractor::Preset> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for preset in attractor::PRESETS {
+                        if ui.small_button(preset.name).clicked() {
+                            chosen = Some(preset);
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                let before = (*kind, *params);
+                ui.label(format!("{} map  (a b c d)", kind.name()));
+                ui.horizontal(|ui| {
+                    for p in params.iter_mut() {
+                        ui.add(egui::DragValue::new(p).speed(0.005).max_decimals(3));
+                    }
+                });
+                // Parameter edits re-fit the view: the attractor's extent
+                // moves with its parameters.
+                let edited = before != (*kind, *params);
+                if let Some(preset) = chosen {
+                    self.apply_attractor_preset(preset);
+                } else if edited {
+                    self.fit_attractor_view();
+                }
+            }
         }
         ui.add_space(8.0);
 
@@ -865,6 +1052,7 @@ impl App {
             match &self.view.rule {
                 FractalRule::Ifs { .. } => self.fit_ifs_view(),
                 FractalRule::LSystem { .. } => self.fit_lsystem_view(),
+                FractalRule::Attractor { .. } => self.fit_attractor_view(),
                 _ => {
                     let (center, upp) = self.view.rule.home_view();
                     self.view.center = deep::BigComplex::from_f64(center[0], center[1]);
@@ -928,15 +1116,17 @@ impl App {
             ui.monospace(format!("y  {im}"));
             ui.monospace(format!("zoom  {zoom:.3e}"));
         }
-        if let (FractalRule::Ifs { points, .. }, Some(cache)) =
-            (&self.view.rule, &self.ifs_cache)
-        {
-            if cache.done < *points {
+        let density_progress = match (&self.view.rule, &self.ifs_cache, &self.attr_cache) {
+            (FractalRule::Ifs { points, .. }, Some(cache), _) => Some((cache.done, *points)),
+            (FractalRule::Attractor { points, .. }, _, Some(cache)) => {
+                Some((cache.done, *points))
+            }
+            _ => None,
+        };
+        if let Some((done, points)) = density_progress {
+            if done < points {
                 ui.add_space(4.0);
-                ui.small(format!(
-                    "rendering… {}%",
-                    100 * cache.done / (*points).max(1)
-                ));
+                ui.small(format!("rendering… {}%", 100 * done / points.max(1)));
             }
         }
         if self.perturbation_active() {
@@ -1040,6 +1230,7 @@ impl App {
         match &self.view.rule {
             FractalRule::Ifs { .. } => self.paint_ifs(ui, rect),
             FractalRule::LSystem { .. } => self.paint_lsystem(ui, rect),
+            FractalRule::Attractor { .. } => self.paint_attractor(ui, rect),
             _ => self.paint_mandelbrot(ui, frame, rect, dragging),
         }
     }
@@ -1319,6 +1510,97 @@ impl App {
         }
     }
 
+    /// Progressive strange attractor, mirroring `paint_ifs`: deterministic
+    /// orbits accumulate a per-frame point batch into the cached histogram;
+    /// palette changes only re-tone-map.
+    fn paint_attractor(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let FractalRule::Attractor {
+            kind,
+            params,
+            points,
+        } = &self.view.rule
+        else {
+            return;
+        };
+        let (kind, params, target) = (*kind, *params, *points);
+
+        let ppp = ui.ctx().pixels_per_point() as f64;
+        let w = ((rect.width() as f64 * ppp) as usize).clamp(16, 4096);
+        let h = ((rect.height() as f64 * ppp) as usize).clamp(16, 4096);
+        let center = self.view.center.to_f64();
+        let units_per_pixel = self.view.units_per_point / ppp;
+        let palette = (
+            self.view.palette,
+            self.view.palette_freq,
+            self.view.palette_phase,
+        );
+
+        let hist_valid = self.attr_cache.as_ref().is_some_and(|c| {
+            c.kind == kind
+                && c.params == params
+                && c.center == center
+                && c.units_per_pixel == units_per_pixel
+                && c.size == [w, h]
+                && c.done <= target
+        });
+        if !hist_valid {
+            let image = egui::ColorImage::filled([w, h], egui::Color32::BLACK);
+            let texture =
+                ui.ctx()
+                    .load_texture("attractor-render", image, egui::TextureOptions::LINEAR);
+            self.attr_cache = Some(AttractorCache {
+                kind,
+                params,
+                center,
+                units_per_pixel,
+                size: [w, h],
+                palette,
+                orbits: attractor::Orbits::new(),
+                done: 0,
+                hist: vec![0u32; w * h],
+                texture,
+            });
+        }
+
+        let cache = self.attr_cache.as_mut().expect("just ensured");
+        let mut retonemap = cache.palette != palette;
+        if cache.done < target {
+            let batch = IFS_POINTS_PER_FRAME.min(target - cache.done);
+            cache.orbits.advance(
+                kind,
+                params,
+                ifs::IfsView {
+                    center,
+                    units_per_pixel,
+                },
+                w,
+                h,
+                &mut cache.hist,
+                batch,
+            );
+            cache.done += batch;
+            retonemap = true;
+        }
+        if retonemap {
+            let rgba = ifs::tonemap_rgba(&cache.hist, palette.0, palette.1, palette.2);
+            cache.texture.set(
+                egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                egui::TextureOptions::LINEAR,
+            );
+            cache.palette = palette;
+        }
+
+        ui.painter().image(
+            cache.texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        if cache.done < target {
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Cached L-system render: segments rebuild only when the rule changes;
     /// the image re-rasterizes when the view, size, or palette changes.
     fn paint_lsystem(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -1469,6 +1751,35 @@ mod tests {
                 assert_eq!(maps, ifs::PRESETS[1].maps.to_vec());
             }
             _ => panic!("rule family lost in round trip"),
+        }
+    }
+
+    #[test]
+    fn julia_and_attractor_bookmarks_round_trip() {
+        for (rule, tag) in [
+            (FractalRule::Julia { c: [-0.8, 0.156] }, r#""family":"julia""#),
+            (
+                FractalRule::Attractor {
+                    kind: attractor::Kind::DeJong,
+                    params: [-2.7, -0.09, -0.86, -2.2],
+                    points: 5_000_000,
+                },
+                r#""family":"attractor""#,
+            ),
+        ] {
+            let view = ViewState {
+                rule: rule.clone(),
+                ..ViewState::default()
+            };
+            let json = serde_json::to_string(&Bookmark {
+                app: "fractalx".into(),
+                version: 3,
+                view,
+            })
+            .unwrap();
+            assert!(json.contains(tag), "{json}");
+            let back: Bookmark = serde_json::from_str(&json).unwrap();
+            assert!(back.view.rule == rule, "rule lost in round trip: {json}");
         }
     }
 
