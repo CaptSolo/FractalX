@@ -5,9 +5,9 @@ A fast, native fractal explorer for macOS, written in Rust with GPU rendering
 
 Zoom into the Mandelbrot set down to **~10³⁰×** magnification — far beyond
 double precision — build iterated function systems (Barnsley fern, Sierpinski
-triangle, or your own) with a live affine-map editor, and export any view as a
-PNG that carries its exact coordinates inside, so every image can be reopened
-right where it was taken.
+triangle, or your own affine maps), grow L-system curves and plants, and
+export any view as a PNG that carries its exact coordinates inside, so every
+image can be reopened right where it was taken.
 
 ![FractalX exploring the Mandelbrot set](assets/full_ui_view.png)
 
@@ -34,9 +34,10 @@ zooming in.*
 - **IFS explorer (chaos game)** — a second fractal family: iterated function
   systems rendered as density plots, computed across all CPU cores with
   deterministic output. Ships with Sierpinski triangle, Barnsley
-  fern, and Heighway dragon presets; edit the affine maps live (or add your
-  own) and watch the attractor respond. *Reset view* fits the viewport to the
-  attractor.
+  fern, and Heighway dragon presets; edit the affine-map coefficients
+  numerically (or add your own maps) and the attractor re-renders. *Reset
+  view* fits the viewport to the attractor. (Visual drag-handle editing is
+  planned, not built yet.)
 - **L-systems** — a third family: axiom + rewrite rules interpreted as turtle
   graphics. Koch snowflake, dragon curve, Sierpinski arrowhead, and fractal
   plant presets, plus a full rule editor (axiom, per-symbol rules, turn angle,
