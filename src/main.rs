@@ -1,6 +1,10 @@
 //! FractalX — fractal explorer prototype.
 //! Milestone 1: GPU Mandelbrot with smooth pan/zoom, iteration and palette controls.
 
+// Windows release builds: GUI subsystem, so no console window opens behind
+// the app. Debug builds keep the console for println/panic output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod attractor;
 mod deep;
 mod export;
@@ -2139,7 +2143,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size([1200.0, 700.0])
             .with_title("FractalX — Fractal Explorer"),
         ..Default::default()
     };
