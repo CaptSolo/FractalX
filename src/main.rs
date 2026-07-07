@@ -1297,11 +1297,11 @@ impl App {
             FractalRule::Terrain(params) => {
                 ui.horizontal(|ui| {
                     ui.label("Seed");
-                    ui.add_sized(
-                        [96.0, ui.spacing().interact_size.y],
-                        egui::DragValue::new(&mut params.seed).speed(1),
-                    );
-                    if ui.small_button("Random").clicked() {
+                    ui.add(egui::DragValue::new(&mut params.seed).speed(1));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    if ui.small_button("Random seed").clicked() {
                         params.seed = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as u64)
